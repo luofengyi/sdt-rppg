@@ -4,6 +4,7 @@ os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 import numpy as np, argparse, time
 import torch
 import torch.optim as optim
+from torch.nn.utils import clip_grad_norm_
 from torch.utils.data import DataLoader
 from torch.utils.data.sampler import SubsetRandomSampler
 from dataloader import IEMOCAPDataset, MELDDataset
@@ -47,14 +48,13 @@ def get_IEMOCAP_loaders(iemocap_pkl_path='data/iemocap_multimodal_features.pkl',
                         session_prefixes=None,
                         use_rppg=False,
                         rppg_npz_path='data/iemocap_rppg_features_ses01_v3.npz',
-                        batch_size=32, valid=0.1, test=0.1, split_seed=42, num_workers=0, pin_memory=False):
+                        batch_size=32, valid=0.1, test=0.1, split_seed=42, split_max_tries=200,
+                        n_classes=6, num_workers=0, pin_memory=False):
     # Build on the same filtered pool so all modalities (including rPPG) share identical split.
     fullset = IEMOCAPDataset(path=iemocap_pkl_path, split='all', session_prefixes=session_prefixes,
                               use_rppg=use_rppg, rppg_npz_path=rppg_npz_path)
     size = len(fullset)
-    idx = list(range(size))
-    rng = np.random.RandomState(split_seed)
-    rng.shuffle(idx)
+    all_idx = list(range(size))
     valid_size = int(valid * size)
     test_size = int(test * size)
     if size > 0 and test_size == 0:
@@ -65,9 +65,46 @@ def get_IEMOCAP_loaders(iemocap_pkl_path='data/iemocap_multimodal_features.pkl',
         test_size = max(1, min(test_size, size - 2))
         valid_size = max(1, min(valid_size, size - test_size - 1))
 
-    test_idx = idx[:test_size]
-    valid_idx = idx[test_size:test_size + valid_size]
-    train_idx = idx[test_size + valid_size:]
+    idx2label_set = {i: set(fullset.videoLabels[fullset.keys[i]]) for i in all_idx}
+
+    def count_covered_classes(indices):
+        c = set()
+        for ii in indices:
+            c.update(idx2label_set[ii])
+        return len(c)
+
+    best = None
+    for t in range(split_max_tries):
+        rng = np.random.RandomState(split_seed + t)
+        idx = all_idx.copy()
+        rng.shuffle(idx)
+
+        test_idx = idx[:test_size]
+        valid_idx = idx[test_size:test_size + valid_size]
+        train_idx = idx[test_size + valid_size:]
+
+        c_train = count_covered_classes(train_idx)
+        c_valid = count_covered_classes(valid_idx)
+        c_test = count_covered_classes(test_idx)
+        score = (min(c_train, c_valid, c_test), c_train + c_valid + c_test)
+
+        if best is None or score > best['score']:
+            best = {
+                'seed': split_seed + t,
+                'train_idx': train_idx,
+                'valid_idx': valid_idx,
+                'test_idx': test_idx,
+                'c_train': c_train,
+                'c_valid': c_valid,
+                'c_test': c_test,
+                'score': score,
+            }
+        if c_train >= n_classes and c_valid >= n_classes and c_test >= n_classes:
+            break
+
+    train_idx = best['train_idx']
+    valid_idx = best['valid_idx']
+    test_idx = best['test_idx']
 
     train_sampler = SubsetRandomSampler(train_idx)
     valid_sampler = SubsetRandomSampler(valid_idx)
@@ -93,7 +130,23 @@ def get_IEMOCAP_loaders(iemocap_pkl_path='data/iemocap_multimodal_features.pkl',
                              pin_memory=pin_memory)
     print('IEMOCAP split size -> train: {}, valid: {}, test: {}'.format(
         len(train_idx), len(valid_idx), len(test_idx)))
+    print('IEMOCAP split class coverage -> train: {}, valid: {}, test: {}, seed: {}'.format(
+        best['c_train'], best['c_valid'], best['c_test'], best['seed']))
     return train_loader, valid_loader, test_loader
+
+
+def build_dynamic_class_weights(dataset, train_indices, n_classes):
+    counts = np.zeros(n_classes, dtype=np.float64)
+    for idx in train_indices:
+        vid = dataset.keys[idx]
+        labels = dataset.videoLabels[vid]
+        for y in labels:
+            if 0 <= y < n_classes:
+                counts[y] += 1.0
+    counts = np.maximum(counts, 1.0)
+    total = np.sum(counts)
+    weights = total / (n_classes * counts)
+    return torch.FloatTensor(weights)
 
 
 def train_or_eval_model(model, loss_function, kl_loss, dataloader, epoch, optimizer=None, train=False, gamma_1=1.0, gamma_2=1.0, gamma_3=1.0, use_rppg=False):
@@ -159,6 +212,8 @@ def train_or_eval_model(model, loss_function, kl_loss, dataloader, epoch, optimi
         losses.append(loss.item()*masks[-1].sum())
         if train:
             loss.backward()
+            if args.grad_clip > 0:
+                clip_grad_norm_(model.parameters(), args.grad_clip)
             if args.tensorboard:
                 for param in model.named_parameters():
                     writer.add_histogram(param[0], param[1].grad, epoch)
@@ -186,13 +241,13 @@ def train_or_eval_model(model, loss_function, kl_loss, dataloader, epoch, optimi
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--no-cuda', action='store_true', default=False, help='does not use GPU')
-    parser.add_argument('--lr', type=float, default=0.0001, metavar='LR', help='learning rate')
+    parser.add_argument('--lr', type=float, default=0.00005, metavar='LR', help='learning rate')
     parser.add_argument('--l2', type=float, default=0.00001, metavar='L2', help='L2 regularization weight')
-    parser.add_argument('--dropout', type=float, default=0.5, metavar='dropout', help='dropout rate')
-    parser.add_argument('--batch-size', type=int, default=16, metavar='BS', help='batch size')
-    parser.add_argument('--hidden_dim', type=int, default=1024, metavar='hidden_dim', help='output hidden size')
-    parser.add_argument('--n_head', type=int, default=8, metavar='n_head', help='number of heads')
-    parser.add_argument('--epochs', type=int, default=150, metavar='E', help='number of epochs')
+    parser.add_argument('--dropout', type=float, default=0.3, metavar='dropout', help='dropout rate')
+    parser.add_argument('--batch-size', type=int, default=2, metavar='BS', help='batch size')
+    parser.add_argument('--hidden_dim', type=int, default=128, metavar='hidden_dim', help='output hidden size')
+    parser.add_argument('--n_head', type=int, default=4, metavar='n_head', help='number of heads')
+    parser.add_argument('--epochs', type=int, default=60, metavar='E', help='number of epochs')
     parser.add_argument('--temp', type=int, default=1, metavar='temp', help='temp')
     parser.add_argument('--tensorboard', action='store_true', default=False, help='Enables tensorboard log')
     parser.add_argument('--class-weight', action='store_true', default=True, help='use class weights')
@@ -211,6 +266,10 @@ if __name__ == '__main__':
                         help='test split ratio for filtered IEMOCAP pool')
     parser.add_argument('--split-seed', type=int, default=42,
                         help='random seed for filtered IEMOCAP split')
+    parser.add_argument('--split-max-tries', type=int, default=300,
+                        help='max resampling tries to improve class coverage in each split')
+    parser.add_argument('--grad-clip', type=float, default=1.0,
+                        help='gradient clipping max norm; <=0 disables clipping')
 
     args = parser.parse_args()
     today = datetime.datetime.now()
@@ -288,8 +347,15 @@ if __name__ == '__main__':
                                                                       valid=args.valid_ratio,
                                                                       test=args.test_ratio,
                                                                       split_seed=args.split_seed,
+                                                                      split_max_tries=args.split_max_tries,
+                                                                      n_classes=n_classes,
                                                                       batch_size=batch_size,
                                                                       num_workers=0)
+        dynamic_loss_weights = build_dynamic_class_weights(
+            train_loader.dataset, train_loader.sampler.indices, n_classes
+        )
+        print('Dynamic class weights:', dynamic_loss_weights.tolist())
+        loss_function = MaskedNLLLoss(dynamic_loss_weights.cuda() if cuda else dynamic_loss_weights)
     else:
         print("There is no such dataset")
 
