@@ -11,8 +11,12 @@ class MaskedKLDivLoss(nn.Module):
         self.loss = nn.KLDivLoss(reduction='sum')
 
     def forward(self, log_pred, target, mask):
-        mask_ = mask.view(-1, 1)
-        loss = self.loss(log_pred * mask_, target * mask_) / torch.sum(mask)   
+        valid = mask.view(-1) > 0
+        if torch.sum(valid).item() == 0:
+            return torch.tensor(0.0, device=log_pred.device, dtype=log_pred.dtype)
+        log_pred_valid = log_pred[valid]
+        target_valid = target[valid]
+        loss = self.loss(log_pred_valid, target_valid) / (torch.sum(valid).float() + 1e-8)
         return loss
 
 
@@ -23,12 +27,16 @@ class MaskedNLLLoss(nn.Module):
         self.loss = nn.NLLLoss(weight=weight, reduction='sum')
 
     def forward(self, pred, target, mask):
-        mask_ = mask.view(-1, 1)
+        valid = mask.view(-1) > 0
+        if torch.sum(valid).item() == 0:
+            return torch.tensor(0.0, device=pred.device, dtype=pred.dtype)
+
+        pred_valid = pred[valid]
+        target_valid = target[valid]
         if type(self.weight) == type(None):
-            loss = self.loss(pred * mask_, target) / torch.sum(mask)
+            loss = self.loss(pred_valid, target_valid) / (torch.sum(valid).float() + 1e-8)
         else:
-            loss = self.loss(pred * mask_, target) \
-                   / torch.sum(self.weight[target] * mask_.squeeze())  
+            loss = self.loss(pred_valid, target_valid) / (torch.sum(self.weight[target_valid]) + 1e-8)
         return loss
 
 def gelu(x):
