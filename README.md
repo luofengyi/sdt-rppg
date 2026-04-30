@@ -14,6 +14,10 @@ This repository is the implementation for our paper *[A Transformer-based Model 
 pip install -r requirements.txt
 ```
 - Download the preprocessed datasets from [here](https://drive.google.com/drive/folders/1J1mvbqQmVodNBzbiOIxRiWOtkP6qqP-K?usp=sharing), and put them into `data/`.
+- If you want to extract rPPG from raw IEMOCAP videos, install extra packages:
+```console
+pip install opencv-python scipy
+```
 
 ## Run SDT model
 - Run the model on IEMOCAP dataset:
@@ -26,6 +30,20 @@ bash exec_iemocap.sh
 
 bash exec_meld.sh
 ```
+
+## Extract rPPG From Raw IEMOCAP Videos (Session1 Example)
+```console
+python extract_rppg_iemocap.py \
+  --iemocap-pkl data/iemocap_multimodal_features.pkl \
+  --video-dir "D:/研究课题/SDT/Session1/Session1/dialog/avi/DivX" \
+  --transcription-dir "D:/研究课题/SDT/Session1/Session1/dialog/transcriptions" \
+  --output-rppg-npz data/iemocap_rppg_features_ses01.npz \
+  --output-pkl data/iemocap_multimodal_features_rppg_ses01.pkl \
+  --session-prefix Ses01
+```
+- The pipeline follows: face ROI tracking -> POS rPPG -> 0.7-4.0Hz band-pass -> 64-d PSD -> quality gate -> 4-layer encoder.
+- `videoRppg342` is aligned to SDT `videoVisual` dimension (`342`) and utterance timeline.
+- `videoRppg1024` keeps the last encoder layer representation (`1024`).
 
 ## Acknowledgements
 - Special thanks to the [COSMIC](https://github.com/declare-lab/conv-emotion) and [MMGCN](https://github.com/hujingwen6666/MMGCN) for sharing their codes and datasets.

@@ -194,24 +194,21 @@ class Multimodal_GatedFusion(nn.Module):
         self.fc = nn.Linear(hidden_size, hidden_size, bias=False)
         self.softmax = nn.Softmax(dim=-2)
 
-    def forward(self, a, b, c):
-        a_new = a.unsqueeze(-2)
-        b_new = b.unsqueeze(-2)
-        c_new = c.unsqueeze(-2)
-        utters = torch.cat([a_new, b_new, c_new], dim=-2)
-        utters_fc = torch.cat([self.fc(a).unsqueeze(-2), self.fc(b).unsqueeze(-2), self.fc(c).unsqueeze(-2)], dim=-2)
+    def forward(self, *modal_reps):
+        utters = torch.cat([x.unsqueeze(-2) for x in modal_reps], dim=-2)
+        utters_fc = torch.cat([self.fc(x).unsqueeze(-2) for x in modal_reps], dim=-2)
         utters_softmax = self.softmax(utters_fc)
-        utters_three_model = utters_softmax * utters
-        final_rep = torch.sum(utters_three_model, dim=-2, keepdim=False)
+        final_rep = torch.sum(utters_softmax * utters, dim=-2, keepdim=False)
         return final_rep
 
 class Transformer_Based_Model(nn.Module):
     def __init__(self, dataset, temp, D_text, D_visual, D_audio, n_head,
-                 n_classes, hidden_dim, n_speakers, dropout):
+                 n_classes, hidden_dim, n_speakers, dropout, use_rppg=False, D_rppg=342):
         super(Transformer_Based_Model, self).__init__()
         self.temp = temp
         self.n_classes = n_classes
         self.n_speakers = n_speakers
+        self.use_rppg = use_rppg
         if self.n_speakers == 2:
             padding_idx = 2
         if self.n_speakers == 9:
@@ -222,6 +219,8 @@ class Transformer_Based_Model(nn.Module):
         self.textf_input = nn.Conv1d(D_text, hidden_dim, kernel_size=1, padding=0, bias=False)
         self.acouf_input = nn.Conv1d(D_audio, hidden_dim, kernel_size=1, padding=0, bias=False)
         self.visuf_input = nn.Conv1d(D_visual, hidden_dim, kernel_size=1, padding=0, bias=False)
+        if self.use_rppg:
+            self.rppgf_input = nn.Conv1d(D_rppg, hidden_dim, kernel_size=1, padding=0, bias=False)
         
         # Intra- and Inter-modal Transformers
         self.t_t = TransformerEncoder(d_model=hidden_dim, d_ff=hidden_dim, heads=n_head, layers=1, dropout=dropout)
@@ -235,6 +234,14 @@ class Transformer_Based_Model(nn.Module):
         self.v_v = TransformerEncoder(d_model=hidden_dim, d_ff=hidden_dim, heads=n_head, layers=1, dropout=dropout)
         self.t_v = TransformerEncoder(d_model=hidden_dim, d_ff=hidden_dim, heads=n_head, layers=1, dropout=dropout)
         self.a_v = TransformerEncoder(d_model=hidden_dim, d_ff=hidden_dim, heads=n_head, layers=1, dropout=dropout)
+        if self.use_rppg:
+            self.r_r = TransformerEncoder(d_model=hidden_dim, d_ff=hidden_dim, heads=n_head, layers=1, dropout=dropout)
+            self.r_t = TransformerEncoder(d_model=hidden_dim, d_ff=hidden_dim, heads=n_head, layers=1, dropout=dropout)
+            self.r_a = TransformerEncoder(d_model=hidden_dim, d_ff=hidden_dim, heads=n_head, layers=1, dropout=dropout)
+            self.r_v = TransformerEncoder(d_model=hidden_dim, d_ff=hidden_dim, heads=n_head, layers=1, dropout=dropout)
+            self.t_r = TransformerEncoder(d_model=hidden_dim, d_ff=hidden_dim, heads=n_head, layers=1, dropout=dropout)
+            self.a_r = TransformerEncoder(d_model=hidden_dim, d_ff=hidden_dim, heads=n_head, layers=1, dropout=dropout)
+            self.v_r = TransformerEncoder(d_model=hidden_dim, d_ff=hidden_dim, heads=n_head, layers=1, dropout=dropout)
         
         # Unimodal-level Gated Fusion
         self.t_t_gate = Unimodal_GatedFusion(hidden_dim, dataset)
@@ -248,10 +255,23 @@ class Transformer_Based_Model(nn.Module):
         self.v_v_gate = Unimodal_GatedFusion(hidden_dim, dataset)
         self.t_v_gate = Unimodal_GatedFusion(hidden_dim, dataset)
         self.a_v_gate = Unimodal_GatedFusion(hidden_dim, dataset)
+        if self.use_rppg:
+            self.r_r_gate = Unimodal_GatedFusion(hidden_dim, dataset)
+            self.r_t_gate = Unimodal_GatedFusion(hidden_dim, dataset)
+            self.r_a_gate = Unimodal_GatedFusion(hidden_dim, dataset)
+            self.r_v_gate = Unimodal_GatedFusion(hidden_dim, dataset)
+            self.t_r_gate = Unimodal_GatedFusion(hidden_dim, dataset)
+            self.a_r_gate = Unimodal_GatedFusion(hidden_dim, dataset)
+            self.v_r_gate = Unimodal_GatedFusion(hidden_dim, dataset)
 
         self.features_reduce_t = nn.Linear(3 * hidden_dim, hidden_dim)
         self.features_reduce_a = nn.Linear(3 * hidden_dim, hidden_dim)
         self.features_reduce_v = nn.Linear(3 * hidden_dim, hidden_dim)
+        if self.use_rppg:
+            self.features_reduce_t = nn.Linear(4 * hidden_dim, hidden_dim)
+            self.features_reduce_a = nn.Linear(4 * hidden_dim, hidden_dim)
+            self.features_reduce_v = nn.Linear(4 * hidden_dim, hidden_dim)
+            self.features_reduce_r = nn.Linear(4 * hidden_dim, hidden_dim)
 
         # Multimodal-level Gated Fusion
         self.last_gate = Multimodal_GatedFusion(hidden_dim)
@@ -272,23 +292,32 @@ class Transformer_Based_Model(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, n_classes)
             )
+        if self.use_rppg:
+            self.r_output_layer = nn.Sequential(
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dim, n_classes)
+            )
         self.all_output_layer = nn.Linear(hidden_dim, n_classes)
 
-    def forward(self, textf, visuf, acouf, u_mask, qmask, dia_len):
+    def forward(self, textf, visuf, acouf, u_mask, qmask, dia_len, rppgf=None):
         spk_idx = torch.argmax(qmask, -1)
         origin_spk_idx = spk_idx
+        device = spk_idx.device
         if self.n_speakers == 2:
             for i, x in enumerate(dia_len):
-                spk_idx[i, x:] = (2*torch.ones(origin_spk_idx[i].size(0)-x)).int().cuda()
+                spk_idx[i, x:] = (2 * torch.ones(origin_spk_idx[i].size(0) - x, device=device)).int()
         if self.n_speakers == 9:
             for i, x in enumerate(dia_len):
-                spk_idx[i, x:] = (9*torch.ones(origin_spk_idx[i].size(0)-x)).int().cuda()
+                spk_idx[i, x:] = (9 * torch.ones(origin_spk_idx[i].size(0) - x, device=device)).int()
         spk_embeddings = self.speaker_embeddings(spk_idx)
 
         # Temporal convolutional layers
         textf = self.textf_input(textf.permute(1, 2, 0)).transpose(1, 2)
         acouf = self.acouf_input(acouf.permute(1, 2, 0)).transpose(1, 2)
         visuf = self.visuf_input(visuf.permute(1, 2, 0)).transpose(1, 2)
+        if self.use_rppg and rppgf is not None:
+            rppgf = self.rppgf_input(rppgf.permute(1, 2, 0)).transpose(1, 2)
 
         # Intra- and Inter-modal Transformers
         t_t_transformer_out = self.t_t(textf, textf, u_mask, spk_embeddings)
@@ -302,6 +331,14 @@ class Transformer_Based_Model(nn.Module):
         v_v_transformer_out = self.v_v(visuf, visuf, u_mask, spk_embeddings)
         t_v_transformer_out = self.t_v(textf, visuf, u_mask, spk_embeddings)
         a_v_transformer_out = self.a_v(acouf, visuf, u_mask, spk_embeddings)
+        if self.use_rppg and rppgf is not None:
+            r_r_transformer_out = self.r_r(rppgf, rppgf, u_mask, spk_embeddings)
+            r_t_transformer_out = self.r_t(rppgf, textf, u_mask, spk_embeddings)
+            r_a_transformer_out = self.r_a(rppgf, acouf, u_mask, spk_embeddings)
+            r_v_transformer_out = self.r_v(rppgf, visuf, u_mask, spk_embeddings)
+            t_r_transformer_out = self.t_r(textf, rppgf, u_mask, spk_embeddings)
+            a_r_transformer_out = self.a_r(acouf, rppgf, u_mask, spk_embeddings)
+            v_r_transformer_out = self.v_r(visuf, rppgf, u_mask, spk_embeddings)
 
         # Unimodal-level Gated Fusion
         t_t_transformer_out = self.t_t_gate(t_t_transformer_out)
@@ -315,23 +352,44 @@ class Transformer_Based_Model(nn.Module):
         v_v_transformer_out = self.v_v_gate(v_v_transformer_out)
         t_v_transformer_out = self.t_v_gate(t_v_transformer_out)
         a_v_transformer_out = self.a_v_gate(a_v_transformer_out)
+        if self.use_rppg and rppgf is not None:
+            r_r_transformer_out = self.r_r_gate(r_r_transformer_out)
+            r_t_transformer_out = self.r_t_gate(r_t_transformer_out)
+            r_a_transformer_out = self.r_a_gate(r_a_transformer_out)
+            r_v_transformer_out = self.r_v_gate(r_v_transformer_out)
+            t_r_transformer_out = self.t_r_gate(t_r_transformer_out)
+            a_r_transformer_out = self.a_r_gate(a_r_transformer_out)
+            v_r_transformer_out = self.v_r_gate(v_r_transformer_out)
 
-        t_transformer_out = self.features_reduce_t(torch.cat([t_t_transformer_out, a_t_transformer_out, v_t_transformer_out], dim=-1))
-        a_transformer_out = self.features_reduce_a(torch.cat([a_a_transformer_out, t_a_transformer_out, v_a_transformer_out], dim=-1))
-        v_transformer_out = self.features_reduce_v(torch.cat([v_v_transformer_out, t_v_transformer_out, a_v_transformer_out], dim=-1))
+        if self.use_rppg and rppgf is not None:
+            t_transformer_out = self.features_reduce_t(torch.cat([t_t_transformer_out, a_t_transformer_out, v_t_transformer_out, r_t_transformer_out], dim=-1))
+            a_transformer_out = self.features_reduce_a(torch.cat([a_a_transformer_out, t_a_transformer_out, v_a_transformer_out, r_a_transformer_out], dim=-1))
+            v_transformer_out = self.features_reduce_v(torch.cat([v_v_transformer_out, t_v_transformer_out, a_v_transformer_out, r_v_transformer_out], dim=-1))
+            r_transformer_out = self.features_reduce_r(torch.cat([r_r_transformer_out, t_r_transformer_out, a_r_transformer_out, v_r_transformer_out], dim=-1))
+        else:
+            t_transformer_out = self.features_reduce_t(torch.cat([t_t_transformer_out, a_t_transformer_out, v_t_transformer_out], dim=-1))
+            a_transformer_out = self.features_reduce_a(torch.cat([a_a_transformer_out, t_a_transformer_out, v_a_transformer_out], dim=-1))
+            v_transformer_out = self.features_reduce_v(torch.cat([v_v_transformer_out, t_v_transformer_out, a_v_transformer_out], dim=-1))
 
         # Multimodal-level Gated Fusion
-        all_transformer_out = self.last_gate(t_transformer_out, a_transformer_out, v_transformer_out)
+        if self.use_rppg and rppgf is not None:
+            all_transformer_out = self.last_gate(t_transformer_out, a_transformer_out, v_transformer_out, r_transformer_out)
+        else:
+            all_transformer_out = self.last_gate(t_transformer_out, a_transformer_out, v_transformer_out)
 
         # Emotion Classifier
         t_final_out = self.t_output_layer(t_transformer_out)
         a_final_out = self.a_output_layer(a_transformer_out)
         v_final_out = self.v_output_layer(v_transformer_out)
+        if self.use_rppg and rppgf is not None:
+            r_final_out = self.r_output_layer(r_transformer_out)
         all_final_out = self.all_output_layer(all_transformer_out)
 
         t_log_prob = F.log_softmax(t_final_out, 2)
         a_log_prob = F.log_softmax(a_final_out, 2)
         v_log_prob = F.log_softmax(v_final_out, 2)
+        if self.use_rppg and rppgf is not None:
+            r_log_prob = F.log_softmax(r_final_out, 2)
 
         all_log_prob = F.log_softmax(all_final_out, 2)
         all_prob = F.softmax(all_final_out, 2)
@@ -339,8 +397,13 @@ class Transformer_Based_Model(nn.Module):
         kl_t_log_prob = F.log_softmax(t_final_out /self.temp, 2)
         kl_a_log_prob = F.log_softmax(a_final_out /self.temp, 2)
         kl_v_log_prob = F.log_softmax(v_final_out /self.temp, 2)
+        if self.use_rppg and rppgf is not None:
+            kl_r_log_prob = F.log_softmax(r_final_out /self.temp, 2)
 
         kl_all_prob = F.softmax(all_final_out /self.temp, 2)
 
+        if self.use_rppg and rppgf is not None:
+            return t_log_prob, a_log_prob, v_log_prob, r_log_prob, all_log_prob, all_prob, \
+                   kl_t_log_prob, kl_a_log_prob, kl_v_log_prob, kl_r_log_prob, kl_all_prob
         return t_log_prob, a_log_prob, v_log_prob, all_log_prob, all_prob, \
                kl_t_log_prob, kl_a_log_prob, kl_v_log_prob, kl_all_prob

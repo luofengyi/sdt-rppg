@@ -43,33 +43,62 @@ def get_MELD_loaders(batch_size=32, valid=0.1, num_workers=0, pin_memory=False):
     return train_loader, valid_loader, test_loader
 
 
-def get_IEMOCAP_loaders(batch_size=32, valid=0.1, num_workers=0, pin_memory=False):
-    trainset = IEMOCAPDataset()
-    train_sampler, valid_sampler = get_train_valid_sampler(trainset, valid)
-    train_loader = DataLoader(trainset,
+def get_IEMOCAP_loaders(iemocap_pkl_path='data/iemocap_multimodal_features.pkl',
+                        session_prefixes=None,
+                        use_rppg=False,
+                        rppg_npz_path='data/iemocap_rppg_features_ses01_v3.npz',
+                        batch_size=32, valid=0.1, test=0.1, split_seed=42, num_workers=0, pin_memory=False):
+    # Build on the same filtered pool so all modalities (including rPPG) share identical split.
+    fullset = IEMOCAPDataset(path=iemocap_pkl_path, split='all', session_prefixes=session_prefixes,
+                              use_rppg=use_rppg, rppg_npz_path=rppg_npz_path)
+    size = len(fullset)
+    idx = list(range(size))
+    rng = np.random.RandomState(split_seed)
+    rng.shuffle(idx)
+    valid_size = int(valid * size)
+    test_size = int(test * size)
+    if size > 0 and test_size == 0:
+        test_size = 1
+    if size > 1 and valid_size == 0:
+        valid_size = 1
+    if valid_size + test_size >= size and size > 2:
+        test_size = max(1, min(test_size, size - 2))
+        valid_size = max(1, min(valid_size, size - test_size - 1))
+
+    test_idx = idx[:test_size]
+    valid_idx = idx[test_size:test_size + valid_size]
+    train_idx = idx[test_size + valid_size:]
+
+    train_sampler = SubsetRandomSampler(train_idx)
+    valid_sampler = SubsetRandomSampler(valid_idx)
+    test_sampler = SubsetRandomSampler(test_idx)
+
+    train_loader = DataLoader(fullset,
                               batch_size=batch_size,
                               sampler=train_sampler,
-                              collate_fn=trainset.collate_fn,
+                              collate_fn=fullset.collate_fn,
                               num_workers=num_workers,
                               pin_memory=pin_memory)
-    valid_loader = DataLoader(trainset,
+    valid_loader = DataLoader(fullset,
                               batch_size=batch_size,
                               sampler=valid_sampler,
-                              collate_fn=trainset.collate_fn,
+                              collate_fn=fullset.collate_fn,
                               num_workers=num_workers,
                               pin_memory=pin_memory)
-
-    testset = IEMOCAPDataset(train=False)
-    test_loader = DataLoader(testset,
+    test_loader = DataLoader(fullset,
                              batch_size=batch_size,
-                             collate_fn=testset.collate_fn,
+                             sampler=test_sampler,
+                             collate_fn=fullset.collate_fn,
                              num_workers=num_workers,
                              pin_memory=pin_memory)
+    print('IEMOCAP split size -> train: {}, valid: {}, test: {}'.format(
+        len(train_idx), len(valid_idx), len(test_idx)))
     return train_loader, valid_loader, test_loader
 
 
-def train_or_eval_model(model, loss_function, kl_loss, dataloader, epoch, optimizer=None, train=False, gamma_1=1.0, gamma_2=1.0, gamma_3=1.0):
+def train_or_eval_model(model, loss_function, kl_loss, dataloader, epoch, optimizer=None, train=False, gamma_1=1.0, gamma_2=1.0, gamma_3=1.0, use_rppg=False):
     losses, preds, labels, masks = [], [], [], []
+    skipped_non_finite = 0
 
     assert not train or optimizer!=None
     if train:
@@ -81,12 +110,19 @@ def train_or_eval_model(model, loss_function, kl_loss, dataloader, epoch, optimi
         if train:
             optimizer.zero_grad()
         
-        textf, visuf, acouf, qmask, umask, label = [d.cuda() for d in data[:-1]] if cuda else data[:-1]
+        if use_rppg:
+            textf, visuf, acouf, rppgf, qmask, umask, label = [d.cuda() for d in data[:-1]] if cuda else data[:-1]
+        else:
+            textf, visuf, acouf, qmask, umask, label = [d.cuda() for d in data[:-1]] if cuda else data[:-1]
         qmask = qmask.permute(1, 0, 2)
         lengths = [(umask[j] == 1).nonzero().tolist()[-1][0] + 1 for j in range(len(umask))]
 
-        log_prob1, log_prob2, log_prob3, all_log_prob, all_prob, \
-        kl_log_prob1, kl_log_prob2, kl_log_prob3, kl_all_prob = model(textf, visuf, acouf, umask, qmask, lengths)
+        if use_rppg:
+            log_prob1, log_prob2, log_prob3, log_prob4, all_log_prob, all_prob, \
+            kl_log_prob1, kl_log_prob2, kl_log_prob3, kl_log_prob4, kl_all_prob = model(textf, visuf, acouf, umask, qmask, lengths, rppgf=rppgf)
+        else:
+            log_prob1, log_prob2, log_prob3, all_log_prob, all_prob, \
+            kl_log_prob1, kl_log_prob2, kl_log_prob3, kl_all_prob = model(textf, visuf, acouf, umask, qmask, lengths)
         
         lp_1 = log_prob1.view(-1, log_prob1.size()[2])
         lp_2 = log_prob2.view(-1, log_prob2.size()[2])
@@ -98,10 +134,16 @@ def train_or_eval_model(model, loss_function, kl_loss, dataloader, epoch, optimi
         kl_lp_2 = kl_log_prob2.view(-1, kl_log_prob2.size()[2])
         kl_lp_3 = kl_log_prob3.view(-1, kl_log_prob3.size()[2])
         kl_p_all = kl_all_prob.view(-1, kl_all_prob.size()[2])
-        
-        loss = gamma_1 * loss_function(lp_all, labels_, umask) + \
-                gamma_2 * (loss_function(lp_1, labels_, umask) + loss_function(lp_2, labels_, umask) + loss_function(lp_3, labels_, umask)) + \
-               gamma_3 * (kl_loss(kl_lp_1, kl_p_all, umask) + kl_loss(kl_lp_2, kl_p_all, umask) + kl_loss(kl_lp_3, kl_p_all, umask))
+        if use_rppg:
+            lp_4 = log_prob4.view(-1, log_prob4.size()[2])
+            kl_lp_4 = kl_log_prob4.view(-1, kl_log_prob4.size()[2])
+            loss = gamma_1 * loss_function(lp_all, labels_, umask) + \
+                    gamma_2 * (loss_function(lp_1, labels_, umask) + loss_function(lp_2, labels_, umask) + loss_function(lp_3, labels_, umask) + loss_function(lp_4, labels_, umask)) + \
+                    gamma_3 * (kl_loss(kl_lp_1, kl_p_all, umask) + kl_loss(kl_lp_2, kl_p_all, umask) + kl_loss(kl_lp_3, kl_p_all, umask) + kl_loss(kl_lp_4, kl_p_all, umask))
+        else:
+            loss = gamma_1 * loss_function(lp_all, labels_, umask) + \
+                    gamma_2 * (loss_function(lp_1, labels_, umask) + loss_function(lp_2, labels_, umask) + loss_function(lp_3, labels_, umask)) + \
+                    gamma_3 * (kl_loss(kl_lp_1, kl_p_all, umask) + kl_loss(kl_lp_2, kl_p_all, umask) + kl_loss(kl_lp_3, kl_p_all, umask))
 
         lp_ = all_prob.view(-1, all_prob.size()[2])
 
@@ -109,6 +151,10 @@ def train_or_eval_model(model, loss_function, kl_loss, dataloader, epoch, optimi
         preds.append(pred_.data.cpu().numpy())
         labels.append(labels_.data.cpu().numpy())
         masks.append(umask.view(-1).cpu().numpy())
+
+        if not torch.isfinite(loss):
+            skipped_non_finite += 1
+            continue
 
         losses.append(loss.item()*masks[-1].sum())
         if train:
@@ -125,9 +171,15 @@ def train_or_eval_model(model, loss_function, kl_loss, dataloader, epoch, optimi
     else:
         return float('nan'), float('nan'), [], [], [], float('nan')
 
+    if len(losses) == 0:
+        return float('nan'), float('nan'), labels, preds, masks, float('nan')
+
     avg_loss = round(np.sum(losses)/np.sum(masks), 4)
     avg_accuracy = round(accuracy_score(labels,preds, sample_weight=masks)*100, 2)
     avg_fscore = round(f1_score(labels,preds, sample_weight=masks, average='weighted')*100, 2)  
+    if skipped_non_finite > 0:
+        mode = 'train' if train else 'eval'
+        print('[Warn][{}][epoch {}] skipped {} non-finite batches'.format(mode, epoch + 1, skipped_non_finite))
     return avg_loss, avg_accuracy, labels, preds, masks, avg_fscore
 
 
@@ -145,10 +197,30 @@ if __name__ == '__main__':
     parser.add_argument('--tensorboard', action='store_true', default=False, help='Enables tensorboard log')
     parser.add_argument('--class-weight', action='store_true', default=True, help='use class weights')
     parser.add_argument('--Dataset', default='IEMOCAP', help='dataset to train and test')
+    parser.add_argument('--iemocap-pkl-path', type=str, default='data/iemocap_multimodal_features.pkl',
+                        help='path of IEMOCAP multimodal feature pkl')
+    parser.add_argument('--iemocap-session-prefixes', type=str, default='Ses01',
+                        help='comma-separated prefixes for IEMOCAP sessions, e.g. Ses01 or Ses01,Ses02')
+    parser.add_argument('--use-rppg', action='store_true', default=False,
+                        help='enable rPPG branch as the 4th modality')
+    parser.add_argument('--iemocap-rppg-npz-path', type=str, default='data/iemocap_rppg_features_ses01_v3.npz',
+                        help='path of extracted rPPG npz (expects key videoRppg342)')
+    parser.add_argument('--valid-ratio', type=float, default=0.1,
+                        help='validation split ratio for filtered IEMOCAP pool')
+    parser.add_argument('--test-ratio', type=float, default=0.1,
+                        help='test split ratio for filtered IEMOCAP pool')
+    parser.add_argument('--split-seed', type=int, default=42,
+                        help='random seed for filtered IEMOCAP split')
 
     args = parser.parse_args()
     today = datetime.datetime.now()
     print(args)
+    if args.Dataset == 'IEMOCAP':
+        print('IEMOCAP feature pkl: {}'.format(args.iemocap_pkl_path))
+        print('IEMOCAP sessions: {}'.format(args.iemocap_session_prefixes))
+        print('Use rPPG branch: {}'.format(args.use_rppg))
+        if args.use_rppg:
+            print('IEMOCAP rPPG npz: {}'.format(args.iemocap_rppg_npz_path))
 
     args.cuda = torch.cuda.is_available() and not args.no_cuda
     if args.cuda:
@@ -166,6 +238,7 @@ if __name__ == '__main__':
     feat2dim = {'IS10':1582, 'denseface':342, 'MELD_audio':300}
     D_audio = feat2dim['IS10'] if args.Dataset=='IEMOCAP' else feat2dim['MELD_audio']
     D_visual = feat2dim['denseface']
+    D_rppg = 342
     D_text = 1024
 
     D_m = D_audio + D_visual + D_text
@@ -179,7 +252,9 @@ if __name__ == '__main__':
                                         n_classes=n_classes,
                                         hidden_dim=args.hidden_dim,
                                         n_speakers=n_speakers,
-                                        dropout=args.dropout)
+                                        dropout=args.dropout,
+                                        use_rppg=args.use_rppg,
+                                        D_rppg=D_rppg)
 
     total_params = sum(p.numel() for p in model.parameters())
     print('total parameters: {}'.format(total_params))
@@ -198,6 +273,7 @@ if __name__ == '__main__':
                                                                     batch_size=batch_size,
                                                                     num_workers=0)
     elif args.Dataset == 'IEMOCAP':
+        iemocap_session_prefixes = [x.strip() for x in args.iemocap_session_prefixes.split(',') if x.strip()]
         loss_weights = torch.FloatTensor([1/0.086747,
                                         1/0.144406,
                                         1/0.227883,
@@ -205,7 +281,13 @@ if __name__ == '__main__':
                                         1/0.127711,
                                         1/0.252668])
         loss_function = MaskedNLLLoss(loss_weights.cuda() if cuda else loss_weights)
-        train_loader, valid_loader, test_loader = get_IEMOCAP_loaders(valid=0.0,
+        train_loader, valid_loader, test_loader = get_IEMOCAP_loaders(iemocap_pkl_path=args.iemocap_pkl_path,
+                                                                      session_prefixes=iemocap_session_prefixes,
+                                                                      use_rppg=args.use_rppg,
+                                                                      rppg_npz_path=args.iemocap_rppg_npz_path,
+                                                                      valid=args.valid_ratio,
+                                                                      test=args.test_ratio,
+                                                                      split_seed=args.split_seed,
                                                                       batch_size=batch_size,
                                                                       num_workers=0)
     else:
@@ -217,12 +299,12 @@ if __name__ == '__main__':
     for e in range(n_epochs):
         start_time = time.time()
 
-        train_loss, train_acc, _, _, _, train_fscore = train_or_eval_model(model, loss_function, kl_loss, train_loader, e, optimizer, True)
-        valid_loss, valid_acc, _, _, _, valid_fscore = train_or_eval_model(model, loss_function, kl_loss, valid_loader, e)
-        test_loss, test_acc, test_label, test_pred, test_mask, test_fscore = train_or_eval_model(model, loss_function, kl_loss, test_loader, e)
+        train_loss, train_acc, _, _, _, train_fscore = train_or_eval_model(model, loss_function, kl_loss, train_loader, e, optimizer, True, use_rppg=args.use_rppg)
+        valid_loss, valid_acc, _, _, _, valid_fscore = train_or_eval_model(model, loss_function, kl_loss, valid_loader, e, use_rppg=args.use_rppg)
+        test_loss, test_acc, test_label, test_pred, test_mask, test_fscore = train_or_eval_model(model, loss_function, kl_loss, test_loader, e, use_rppg=args.use_rppg)
         all_fscore.append(test_fscore)
 
-        if best_fscore == None or best_fscore < test_fscore:
+        if (test_label is not None) and (len(test_label) > 0) and (best_fscore == None or best_fscore < test_fscore):
             best_fscore = test_fscore
             best_label, best_pred, best_mask = test_label, test_pred, test_mask
 
@@ -234,7 +316,7 @@ if __name__ == '__main__':
 
         print('epoch: {}, train_loss: {}, train_acc: {}, train_fscore: {}, valid_loss: {}, valid_acc: {}, valid_fscore: {}, test_loss: {}, test_acc: {}, test_fscore: {}, time: {} sec'.\
                 format(e+1, train_loss, train_acc, train_fscore, valid_loss, valid_acc, valid_fscore, test_loss, test_acc, test_fscore, round(time.time()-start_time, 2)))
-        if (e+1)%10 == 0:
+        if (e+1)%10 == 0 and best_label is not None and len(best_label) > 0:
             print(classification_report(best_label, best_pred, sample_weight=best_mask,digits=4))
             print(confusion_matrix(best_label,best_pred,sample_weight=best_mask))
 
@@ -256,14 +338,21 @@ if __name__ == '__main__':
         record[key_].append(max(all_fscore))
     else:
         record[key_] = [max(all_fscore)]
-    if record.get(key_+'record', False):
-        record[key_+'record'].append(classification_report(best_label, best_pred, sample_weight=best_mask,digits=4))
+    if best_label is not None and len(best_label) > 0:
+        best_report = classification_report(best_label, best_pred, sample_weight=best_mask,digits=4)
     else:
-        record[key_+'record'] = [classification_report(best_label, best_pred, sample_weight=best_mask,digits=4)]
+        best_report = 'No non-empty test split after filtering; classification report skipped.'
+    if record.get(key_+'record', False):
+        record[key_+'record'].append(best_report)
+    else:
+        record[key_+'record'] = [best_report]
     with open("record_{}_{}_{}.pk".format(today.year, today.month, today.day),'wb') as f:
         pk.dump(record, f)
 
-    print(classification_report(best_label, best_pred, sample_weight=best_mask,digits=4))
-    print(confusion_matrix(best_label,best_pred,sample_weight=best_mask))
+    if best_label is not None and len(best_label) > 0:
+        print(classification_report(best_label, best_pred, sample_weight=best_mask,digits=4))
+        print(confusion_matrix(best_label,best_pred,sample_weight=best_mask))
+    else:
+        print('No non-empty test split after filtering; skipped classification report and confusion matrix.')
 
 

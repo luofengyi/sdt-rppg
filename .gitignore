@@ -4,3 +4,8 @@
 
 *.pk
 *.pkl
+*.npz
+*.png
+data/rppg_plots_*/
+data/quality_report_*.csv
+data/rppg_alignment_report_*.csv
