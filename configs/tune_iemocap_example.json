@@ -3,13 +3,14 @@
   "output_dir": "tuning_runs",
   "fixed_args": {
     "Dataset": "IEMOCAP",
-    "iemocap-pkl-path": "data/iemocap_multimodal_features_rppg_ses01.pkl",
+    "iemocap-pkl-path": "data/iemocap_multimodal_features_rppg_ses01_v3.pkl",
     "iemocap-session-prefixes": "Ses01",
     "epochs": 60,
     "temp": 1,
     "split-seed": 42,
     "valid-ratio": 0.1,
     "test-ratio": 0.1,
+    "iemocap-rppg-npz-path": "data/iemocap_rppg_features_ses01_v3.npz",
     "ulgm-normalize-alpha": true
   },
   "hard_constraints": {
