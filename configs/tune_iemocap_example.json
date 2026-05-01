@@ -1,0 +1,43 @@
+{
+  "run_name": "iemocap_baseline_search",
+  "output_dir": "tuning_runs",
+  "fixed_args": {
+    "Dataset": "IEMOCAP",
+    "iemocap-pkl-path": "data/iemocap_multimodal_features_rppg_ses01.pkl",
+    "iemocap-session-prefixes": "Ses01",
+    "epochs": 60,
+    "temp": 1,
+    "split-seed": 42,
+    "valid-ratio": 0.1,
+    "test-ratio": 0.1,
+    "ulgm-normalize-alpha": true
+  },
+  "hard_constraints": {
+    "enabled": true,
+    "alpha_keys": ["ulgm-alpha-t", "ulgm-alpha-a", "ulgm-alpha-v", "ulgm-alpha-r"],
+    "require_alpha_sum": 1.0,
+    "alpha_sum_tolerance": 1e-6,
+    "enforce_alpha_non_negative": true,
+    "use_rppg_key": "use-rppg",
+    "alpha_r_key": "ulgm-alpha-r",
+    "only_when_normalize_alpha": true,
+    "normalize_alpha_key": "ulgm-normalize-alpha"
+  },
+  "param_space": {
+    "lr": [0.00005, 0.0001],
+    "batch-size": [8, 16],
+    "dropout": [0.2, 0.3],
+    "hidden_dim": [128, 256],
+    "n_head": [4, 8],
+    "grad-clip": [0.5, 1.0],
+    "use-rppg": [true],
+    "ulgm-alpha-t": [0.4, 0.5],
+    "ulgm-alpha-a": [0.15, 0.2],
+    "ulgm-alpha-v": [0.15, 0.2],
+    "ulgm-alpha-r": [0.1, 0.15],
+    "ulgm-lambda-max": [0.0015, 0.002],
+    "ulgm-lambda-min": [0.0005],
+    "ulgm-e-delay": [3],
+    "ulgm-e-ramp": [8]
+  }
+}

@@ -31,6 +31,30 @@ bash exec_iemocap.sh
 bash exec_meld.sh
 ```
 
+## One-Click Hyperparameter Tuning
+- Use the built-in tuner to run multiple training trials automatically and keep the best result.
+- Example command:
+```console
+python tune_one_click.py --config configs/tune_iemocap_example.json --mode grid
+```
+- Random search (limit number of trials):
+```console
+python tune_one_click.py --config configs/tune_iemocap_example.json --mode random --max-trials 20 --seed 42
+```
+- Output files are saved under `tuning_runs/<run_name>_<timestamp>/`:
+  - `results.csv`: every trial metrics and args
+  - `summary.json`: best trial summary
+  - `logs/trial_*.log`: full training logs
+- To tune your ULGM parameters later, add them to:
+  - `fixed_args` if you want to keep them fixed
+  - `param_space` if you want the tuner to search them
+- ULGM alpha normalization:
+  - Add `--ulgm-normalize-alpha` to normalize active modality weights to sum to 1.
+  - In tuner json, set `"ulgm-normalize-alpha": [true]` in `param_space` or `fixed_args`.
+- Hard-constraint mode in tuner:
+  - Add `hard_constraints.enabled=true` in tuner config to filter invalid trials before training.
+  - Built-in example enforces active ULGM alpha sum to 1 (with tolerance), non-negative alpha, and ignores `alpha_r` when `use-rppg=false`.
+
 ## Extract rPPG From Raw IEMOCAP Videos (Session1 Example)
 ```console
 python extract_rppg_iemocap.py \
