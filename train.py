@@ -4,6 +4,7 @@ os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 import numpy as np, argparse, time
 import torch
 import torch.optim as optim
+import torch.nn.functional as F
 from torch.nn.utils import clip_grad_norm_
 from torch.utils.data import DataLoader
 from torch.utils.data.sampler import SubsetRandomSampler
@@ -205,7 +206,96 @@ def build_dynamic_class_weights(dataset, train_indices, n_classes):
     return torch.FloatTensor(weights)
 
 
-def train_or_eval_model(model, loss_function, kl_loss, dataloader, epoch, optimizer=None, train=False, gamma_1=1.0, gamma_2=1.0, gamma_3=1.0, use_rppg=False, ulgm_lambda=1.0, ulgm_alphas=None):
+def count_iemocap_utterance_class_counts(dataset, train_indices, n_classes):
+    counts = np.zeros(n_classes, dtype=np.float64)
+    for idx in train_indices:
+        vid = dataset.keys[idx]
+        for y in dataset.videoLabels[vid]:
+            if 0 <= int(y) < n_classes:
+                counts[int(y)] += 1.0
+    counts = np.maximum(counts, 1.0)
+    return counts
+
+
+def build_auto_class_weights_paper(counts, clip_min=0.4, clip_max=2.5):
+    counts = np.asarray(counts, dtype=np.float64)
+    n_classes = counts.shape[0]
+    total = float(np.sum(counts))
+    w_init = total / (n_classes * counts)
+    w = w_init / (np.mean(w_init) + 1e-12)
+    w = np.clip(w, clip_min, clip_max)
+    w_hat = w / (np.mean(w) + 1e-12)
+    return torch.FloatTensor(w_hat)
+
+
+def compute_beta_schedule(epoch, beta_init, beta_target, e_delay, e_warmup):
+    if epoch < e_delay:
+        return beta_init
+    if e_warmup <= 0:
+        return beta_target
+    if epoch < e_delay + e_warmup:
+        t = float(epoch - e_delay + 1) / float(e_warmup)
+        t = max(0.0, min(1.0, t))
+        return beta_init + t * (beta_target - beta_init)
+    return beta_target
+
+
+def compute_happy_boost(epoch, gamma_max, e_boost):
+    if e_boost <= 0:
+        return 1.0
+    val = gamma_max - (float(epoch) / float(e_boost)) * (gamma_max - 1.0)
+    return float(max(1.0, val))
+
+
+def masked_mean(x, mask):
+    mask = mask.view(-1).float()
+    denom = torch.sum(mask) + 1e-8
+    return torch.sum(x.view(-1) * mask) / denom
+
+
+def build_pseudo_targets_for_modality(log_prob_m, labels_flat, n_classes, happy_class,
+                                      tau_conf, omega_true_major, omega_true_happy):
+    # log_prob_m: [N, C] (flattened time*batch)
+    probs_m = torch.exp(log_prob_m)
+    conf_m, pred_m = torch.max(probs_m, dim=-1)
+
+    y = labels_flat.long()
+    y_onehot = F.one_hot(y, num_classes=n_classes).float()
+
+    pred_onehot = F.one_hot(pred_m, num_classes=n_classes).float()
+
+    is_happy = (y == int(happy_class))
+    high_conf = conf_m >= float(tau_conf)
+    use_mix = is_happy & high_conf
+
+    omega = torch.where(
+        is_happy,
+        torch.full_like(y, float(omega_true_happy), dtype=torch.float32, device=log_prob_m.device),
+        torch.full_like(y, float(omega_true_major), dtype=torch.float32, device=log_prob_m.device),
+    )
+
+    omega = torch.where(use_mix, omega, torch.ones_like(omega))
+    target = omega.unsqueeze(-1) * y_onehot + (1.0 - omega.unsqueeze(-1)) * pred_onehot
+    return target, use_mix
+
+
+def unimodal_pseudo_loss_per_pos(log_prob_m, target_dist, class_weights_vec, labels_flat):
+    # cross-entropy with soft targets: -sum_k target_k log p_k  (per position)
+    ce = -(target_dist * log_prob_m).sum(dim=-1)
+    if class_weights_vec is not None:
+        w = class_weights_vec[labels_flat]
+        ce = ce * w
+    return ce
+
+
+def train_or_eval_model(model, loss_function, kl_loss, dataloader, epoch, optimizer=None, train=False,
+                        gamma_1=1.0, gamma_2=1.0, gamma_3=1.0, use_rppg=False,
+                        beta_e=1.0, ulgm_alphas=None,
+                        n_classes=6, happy_class=1, tau_conf=0.8,
+                        omega_true_major=0.3, omega_true_happy=0.7,
+                        gamma_boost=1.0, happy_class_idx=1,
+                        alpha_recon=0.01, alpha_gate=0.01,
+                        use_pseudo_ulgm=True, use_aux_losses=True):
     losses, preds, labels, masks = [], [], [], []
     skipped_non_finite = 0
 
@@ -230,11 +320,21 @@ def train_or_eval_model(model, loss_function, kl_loss, dataloader, epoch, optimi
         lengths = [(umask[j] == 1).nonzero().tolist()[-1][0] + 1 for j in range(len(umask))]
 
         if use_rppg:
-            log_prob1, log_prob2, log_prob3, log_prob4, all_log_prob, all_prob, \
-            kl_log_prob1, kl_log_prob2, kl_log_prob3, kl_log_prob4, kl_all_prob = model(textf, visuf, acouf, umask, qmask, lengths, rppgf=rppgf)
+            if use_aux_losses:
+                log_prob1, log_prob2, log_prob3, log_prob4, all_log_prob, all_prob, \
+                kl_log_prob1, kl_log_prob2, kl_log_prob3, kl_log_prob4, kl_all_prob, \
+                recon_loss, gate_entropy = model(textf, visuf, acouf, umask, qmask, lengths, rppgf=rppgf, return_aux_losses=True)
+            else:
+                log_prob1, log_prob2, log_prob3, log_prob4, all_log_prob, all_prob, \
+                kl_log_prob1, kl_log_prob2, kl_log_prob3, kl_log_prob4, kl_all_prob = model(textf, visuf, acouf, umask, qmask, lengths, rppgf=rppgf)
         else:
-            log_prob1, log_prob2, log_prob3, all_log_prob, all_prob, \
-            kl_log_prob1, kl_log_prob2, kl_log_prob3, kl_all_prob = model(textf, visuf, acouf, umask, qmask, lengths)
+            if use_aux_losses:
+                log_prob1, log_prob2, log_prob3, all_log_prob, all_prob, \
+                kl_log_prob1, kl_log_prob2, kl_log_prob3, kl_all_prob, \
+                recon_loss, gate_entropy = model(textf, visuf, acouf, umask, qmask, lengths, return_aux_losses=True)
+            else:
+                log_prob1, log_prob2, log_prob3, all_log_prob, all_prob, \
+                kl_log_prob1, kl_log_prob2, kl_log_prob3, kl_all_prob = model(textf, visuf, acouf, umask, qmask, lengths)
         
         lp_1 = log_prob1.view(-1, log_prob1.size()[2])
         lp_2 = log_prob2.view(-1, log_prob2.size()[2])
@@ -249,20 +349,69 @@ def train_or_eval_model(model, loss_function, kl_loss, dataloader, epoch, optimi
         if use_rppg:
             lp_4 = log_prob4.view(-1, log_prob4.size()[2])
             kl_lp_4 = kl_log_prob4.view(-1, kl_log_prob4.size()[2])
-            ulgm_loss = ulgm_alphas['t'] * loss_function(lp_1, labels_, umask) + \
-                        ulgm_alphas['v'] * loss_function(lp_2, labels_, umask) + \
-                        ulgm_alphas['a'] * loss_function(lp_3, labels_, umask) + \
-                        ulgm_alphas['r'] * loss_function(lp_4, labels_, umask)
+            if use_pseudo_ulgm:
+                cw = getattr(loss_function, 'weight', None)
+                tgt1, _ = build_pseudo_targets_for_modality(lp_1, labels_, n_classes, happy_class, tau_conf, omega_true_major, omega_true_happy)
+                tgt2, _ = build_pseudo_targets_for_modality(lp_2, labels_, n_classes, happy_class, tau_conf, omega_true_major, omega_true_happy)
+                tgt3, _ = build_pseudo_targets_for_modality(lp_3, labels_, n_classes, happy_class, tau_conf, omega_true_major, omega_true_happy)
+                tgt4, _ = build_pseudo_targets_for_modality(lp_4, labels_, n_classes, happy_class, tau_conf, omega_true_major, omega_true_happy)
+
+                l1 = unimodal_pseudo_loss_per_pos(lp_1, tgt1, cw, labels_)
+                l2 = unimodal_pseudo_loss_per_pos(lp_2, tgt2, cw, labels_)
+                l3 = unimodal_pseudo_loss_per_pos(lp_3, tgt3, cw, labels_)
+                l4 = unimodal_pseudo_loss_per_pos(lp_4, tgt4, cw, labels_)
+
+                happy_mask = (labels_ == int(happy_class_idx)).float()
+                boost_w = 1.0 + (float(gamma_boost) - 1.0) * happy_mask
+                l1 = l1 * boost_w
+                l2 = l2 * boost_w
+                l3 = l3 * boost_w
+                l4 = l4 * boost_w
+
+                ulgm_loss = ulgm_alphas['t'] * masked_mean(l1, umask) + \
+                            ulgm_alphas['v'] * masked_mean(l2, umask) + \
+                            ulgm_alphas['a'] * masked_mean(l3, umask) + \
+                            ulgm_alphas['r'] * masked_mean(l4, umask)
+            else:
+                ulgm_loss = ulgm_alphas['t'] * loss_function(lp_1, labels_, umask) + \
+                            ulgm_alphas['v'] * loss_function(lp_2, labels_, umask) + \
+                            ulgm_alphas['a'] * loss_function(lp_3, labels_, umask) + \
+                            ulgm_alphas['r'] * loss_function(lp_4, labels_, umask)
             loss = gamma_1 * loss_function(lp_all, labels_, umask) + \
-                    gamma_2 * ulgm_lambda * ulgm_loss + \
+                    gamma_2 * beta_e * ulgm_loss + \
                     gamma_3 * (kl_loss(kl_lp_1, kl_p_all, umask) + kl_loss(kl_lp_2, kl_p_all, umask) + kl_loss(kl_lp_3, kl_p_all, umask) + kl_loss(kl_lp_4, kl_p_all, umask))
         else:
-            ulgm_loss = ulgm_alphas['t'] * loss_function(lp_1, labels_, umask) + \
-                        ulgm_alphas['v'] * loss_function(lp_2, labels_, umask) + \
-                        ulgm_alphas['a'] * loss_function(lp_3, labels_, umask)
+            if use_pseudo_ulgm:
+                cw = getattr(loss_function, 'weight', None)
+                tgt1, _ = build_pseudo_targets_for_modality(lp_1, labels_, n_classes, happy_class, tau_conf, omega_true_major, omega_true_happy)
+                tgt2, _ = build_pseudo_targets_for_modality(lp_2, labels_, n_classes, happy_class, tau_conf, omega_true_major, omega_true_happy)
+                tgt3, _ = build_pseudo_targets_for_modality(lp_3, labels_, n_classes, happy_class, tau_conf, omega_true_major, omega_true_happy)
+
+                l1 = unimodal_pseudo_loss_per_pos(lp_1, tgt1, cw, labels_)
+                l2 = unimodal_pseudo_loss_per_pos(lp_2, tgt2, cw, labels_)
+                l3 = unimodal_pseudo_loss_per_pos(lp_3, tgt3, cw, labels_)
+
+                happy_mask = (labels_ == int(happy_class_idx)).float()
+                boost_w = 1.0 + (float(gamma_boost) - 1.0) * happy_mask
+                l1 = l1 * boost_w
+                l2 = l2 * boost_w
+                l3 = l3 * boost_w
+
+                ulgm_loss = ulgm_alphas['t'] * masked_mean(l1, umask) + \
+                            ulgm_alphas['v'] * masked_mean(l2, umask) + \
+                            ulgm_alphas['a'] * masked_mean(l3, umask)
+            else:
+                ulgm_loss = ulgm_alphas['t'] * loss_function(lp_1, labels_, umask) + \
+                            ulgm_alphas['v'] * loss_function(lp_2, labels_, umask) + \
+                            ulgm_alphas['a'] * loss_function(lp_3, labels_, umask)
             loss = gamma_1 * loss_function(lp_all, labels_, umask) + \
-                    gamma_2 * ulgm_lambda * ulgm_loss + \
+                    gamma_2 * beta_e * ulgm_loss + \
                     gamma_3 * (kl_loss(kl_lp_1, kl_p_all, umask) + kl_loss(kl_lp_2, kl_p_all, umask) + kl_loss(kl_lp_3, kl_p_all, umask))
+
+        if use_aux_losses:
+            recon_term = alpha_recon * masked_mean(recon_loss.view(-1), umask)
+            gate_term = alpha_gate * masked_mean(gate_entropy.view(-1), umask)
+            loss = loss + recon_term + gate_term
 
         lp_ = all_prob.view(-1, all_prob.size()[2])
 
@@ -355,8 +504,37 @@ if __name__ == '__main__':
     parser.add_argument('--ulgm-normalize-alpha', action='store_true', default=False,
                         help='normalize active ULGM alpha weights to sum to 1')
 
+    parser.add_argument('--gamma-1', type=float, default=1.0, help='weight for fused NLL task loss')
+    parser.add_argument('--gamma-2', type=float, default=1.0, help='weight for ULGM term (multiplied by beta schedule)')
+    parser.add_argument('--gamma-3', type=float, default=1.0, help='weight for KL self-distillation term (set 0 to disable)')
+
+    parser.add_argument('--class-weight-mode', type=str, default='paper',
+                        choices=['none', 'legacy', 'paper'],
+                        help='IEMOCAP class weight strategy for NLL losses')
+
+    parser.add_argument('--cw-clip-min', type=float, default=0.4, help='paper class weight clip min lambda_min')
+    parser.add_argument('--cw-clip-max', type=float, default=2.5, help='paper class weight clip max lambda_max')
+
+    parser.add_argument('--no-pseudo-ulgm', action='store_true', default=False,
+                        help='disable pseudo-label ULGM; use standard label NLL on unimodal heads')
+    parser.add_argument('--pseudo-tau-conf', type=float, default=0.8, help='confidence threshold for happy pseudo mixing')
+    parser.add_argument('--pseudo-omega-major', type=float, default=0.3, help='omega_true for non-happy rows in mixing')
+    parser.add_argument('--pseudo-omega-happy', type=float, default=0.7, help='omega_true for happy rows when mixing triggers')
+    parser.add_argument('--iemocap-happy-class', type=int, default=1,
+                        help='IEMOCAP label id treated as Happy for pseudo/boosting (dataset-specific)')
+
+    parser.add_argument('--happy-boost-max', type=float, default=1.5, help='gamma_max for happy early boosting')
+    parser.add_argument('--happy-boost-epochs', type=int, default=10, help='E_boost for happy early boosting')
+
+    parser.add_argument('--alpha-recon', type=float, default=0.01, help='weight for reconstruction loss')
+    parser.add_argument('--alpha-gate', type=float, default=0.01, help='weight for multimodal gate entropy regularizer')
+    parser.add_argument('--no-aux-losses', action='store_true', default=False,
+                        help='disable recon+gate auxiliary losses')
+
     args = parser.parse_args()
     validate_ulgm_args(args)
+    if (args.Dataset == 'IEMOCAP') and (not args.class_weight):
+        args.class_weight_mode = 'none'
     today = datetime.datetime.now()
     print(args)
     if args.Dataset == 'IEMOCAP':
@@ -394,7 +572,7 @@ if __name__ == '__main__':
     ulgm_alphas = build_ulgm_alphas(args)
     print('ULGM alphas: t={:.4f}, a={:.4f}, v={:.4f}, r={:.4f} (normalized={})'.format(
         ulgm_alphas['t'], ulgm_alphas['a'], ulgm_alphas['v'], ulgm_alphas['r'], args.ulgm_normalize_alpha))
-    print('ULGM lambda schedule: min={}, max={}, delay={}, ramp={}'.format(
+    print('ULGM beta schedule: init={}, target={}, delay={}, warmup={}'.format(
         args.ulgm_lambda_min, args.ulgm_lambda_max, args.ulgm_e_delay, args.ulgm_e_ramp))
 
     model = Transformer_Based_Model(args.Dataset, args.temp, D_text, D_visual, D_audio, args.n_head,
@@ -423,13 +601,6 @@ if __name__ == '__main__':
                                                                     num_workers=0)
     elif args.Dataset == 'IEMOCAP':
         iemocap_session_prefixes = [x.strip() for x in args.iemocap_session_prefixes.split(',') if x.strip()]
-        loss_weights = torch.FloatTensor([1/0.086747,
-                                        1/0.144406,
-                                        1/0.227883,
-                                        1/0.160585,
-                                        1/0.127711,
-                                        1/0.252668])
-        loss_function = MaskedNLLLoss(loss_weights.cuda() if cuda else loss_weights)
         train_loader, valid_loader, test_loader = get_IEMOCAP_loaders(iemocap_pkl_path=args.iemocap_pkl_path,
                                                                       session_prefixes=iemocap_session_prefixes,
                                                                       use_rppg=args.use_rppg,
@@ -441,11 +612,28 @@ if __name__ == '__main__':
                                                                       n_classes=n_classes,
                                                                       batch_size=batch_size,
                                                                       num_workers=0)
-        dynamic_loss_weights = build_dynamic_class_weights(
-            train_loader.dataset, train_loader.sampler.indices, n_classes
-        )
-        print('Dynamic class weights:', dynamic_loss_weights.tolist())
-        loss_function = MaskedNLLLoss(dynamic_loss_weights.cuda() if cuda else dynamic_loss_weights)
+        if args.class_weight_mode == 'none':
+            loss_function = MaskedNLLLoss()
+            print('IEMOCAP class weights: disabled')
+        elif args.class_weight_mode == 'legacy':
+            loss_weights = torch.FloatTensor([1/0.086747,
+                                            1/0.144406,
+                                            1/0.227883,
+                                            1/0.160585,
+                                            1/0.127711,
+                                            1/0.252668])
+            lw = loss_weights.cuda() if cuda else loss_weights
+            loss_function = MaskedNLLLoss(lw)
+            print('IEMOCAP class weights (legacy fixed):', lw.tolist())
+        else:
+            counts = count_iemocap_utterance_class_counts(
+                train_loader.dataset, train_loader.sampler.indices, n_classes
+            )
+            w_hat = build_auto_class_weights_paper(counts, clip_min=args.cw_clip_min, clip_max=args.cw_clip_max)
+            lw = w_hat.cuda() if cuda else w_hat
+            loss_function = MaskedNLLLoss(lw)
+            print('IEMOCAP class counts (train split utterances):', counts.tolist())
+            print('IEMOCAP class weights (paper):', lw.tolist())
     else:
         print("There is no such dataset")
 
@@ -454,20 +642,56 @@ if __name__ == '__main__':
 
     for e in range(n_epochs):
         start_time = time.time()
-        ulgm_lambda_e = compute_ulgm_lambda(
+        beta_e = compute_beta_schedule(
             e, args.ulgm_lambda_min, args.ulgm_lambda_max, args.ulgm_e_delay, args.ulgm_e_ramp
         )
+        gamma_boost_e = compute_happy_boost(e, args.happy_boost_max, args.happy_boost_epochs)
+        use_pseudo_ulgm = (args.Dataset == 'IEMOCAP') and (not args.no_pseudo_ulgm)
+        use_aux_losses = (not args.no_aux_losses)
         train_loss, train_acc, _, _, _, train_fscore = train_or_eval_model(
             model, loss_function, kl_loss, train_loader, e, optimizer, True,
-            use_rppg=args.use_rppg, ulgm_lambda=ulgm_lambda_e, ulgm_alphas=ulgm_alphas
+            gamma_1=args.gamma_1, gamma_2=args.gamma_2, gamma_3=args.gamma_3,
+            use_rppg=args.use_rppg, beta_e=beta_e, ulgm_alphas=ulgm_alphas,
+            n_classes=n_classes, happy_class=args.iemocap_happy_class,
+            tau_conf=args.pseudo_tau_conf,
+            omega_true_major=args.pseudo_omega_major,
+            omega_true_happy=args.pseudo_omega_happy,
+            gamma_boost=gamma_boost_e,
+            happy_class_idx=args.iemocap_happy_class,
+            alpha_recon=args.alpha_recon,
+            alpha_gate=args.alpha_gate,
+            use_pseudo_ulgm=use_pseudo_ulgm,
+            use_aux_losses=use_aux_losses,
         )
         valid_loss, valid_acc, _, _, _, valid_fscore = train_or_eval_model(
             model, loss_function, kl_loss, valid_loader, e,
-            use_rppg=args.use_rppg, ulgm_lambda=ulgm_lambda_e, ulgm_alphas=ulgm_alphas
+            gamma_1=args.gamma_1, gamma_2=args.gamma_2, gamma_3=args.gamma_3,
+            use_rppg=args.use_rppg, beta_e=beta_e, ulgm_alphas=ulgm_alphas,
+            n_classes=n_classes, happy_class=args.iemocap_happy_class,
+            tau_conf=args.pseudo_tau_conf,
+            omega_true_major=args.pseudo_omega_major,
+            omega_true_happy=args.pseudo_omega_happy,
+            gamma_boost=gamma_boost_e,
+            happy_class_idx=args.iemocap_happy_class,
+            alpha_recon=args.alpha_recon,
+            alpha_gate=args.alpha_gate,
+            use_pseudo_ulgm=use_pseudo_ulgm,
+            use_aux_losses=use_aux_losses,
         )
         test_loss, test_acc, test_label, test_pred, test_mask, test_fscore = train_or_eval_model(
             model, loss_function, kl_loss, test_loader, e,
-            use_rppg=args.use_rppg, ulgm_lambda=ulgm_lambda_e, ulgm_alphas=ulgm_alphas
+            gamma_1=args.gamma_1, gamma_2=args.gamma_2, gamma_3=args.gamma_3,
+            use_rppg=args.use_rppg, beta_e=beta_e, ulgm_alphas=ulgm_alphas,
+            n_classes=n_classes, happy_class=args.iemocap_happy_class,
+            tau_conf=args.pseudo_tau_conf,
+            omega_true_major=args.pseudo_omega_major,
+            omega_true_happy=args.pseudo_omega_happy,
+            gamma_boost=gamma_boost_e,
+            happy_class_idx=args.iemocap_happy_class,
+            alpha_recon=args.alpha_recon,
+            alpha_gate=args.alpha_gate,
+            use_pseudo_ulgm=use_pseudo_ulgm,
+            use_aux_losses=use_aux_losses,
         )
         all_fscore.append(test_fscore)
 
@@ -481,8 +705,8 @@ if __name__ == '__main__':
             writer.add_scalar('train: accuracy', train_acc, e)
             writer.add_scalar('train: fscore', train_fscore, e)
 
-        print('epoch: {}, ulgm_lambda: {:.6f}, train_loss: {}, train_acc: {}, train_fscore: {}, valid_loss: {}, valid_acc: {}, valid_fscore: {}, test_loss: {}, test_acc: {}, test_fscore: {}, time: {} sec'.\
-                format(e+1, ulgm_lambda_e, train_loss, train_acc, train_fscore, valid_loss, valid_acc, valid_fscore, test_loss, test_acc, test_fscore, round(time.time()-start_time, 2)))
+        print('epoch: {}, beta_ulgm: {:.6f}, happy_boost: {:.4f}, train_loss: {}, train_acc: {}, train_fscore: {}, valid_loss: {}, valid_acc: {}, valid_fscore: {}, test_loss: {}, test_acc: {}, test_fscore: {}, time: {} sec'.\
+                format(e+1, beta_e, gamma_boost_e, train_loss, train_acc, train_fscore, valid_loss, valid_acc, valid_fscore, test_loss, test_acc, test_fscore, round(time.time()-start_time, 2)))
         if (e+1)%10 == 0 and best_label is not None and len(best_label) > 0:
             print(classification_report(best_label, best_pred, sample_weight=best_mask,digits=4))
             print(confusion_matrix(best_label,best_pred,sample_weight=best_mask))
