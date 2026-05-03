@@ -240,6 +240,20 @@ def compute_beta_schedule(epoch, beta_init, beta_target, e_delay, e_warmup):
     return beta_target
 
 
+def compute_gamma2_schedule(epoch, gamma2, gamma2_start, warmup_epochs):
+    """Linear ramp of outer ULGM weight γ₂ from gamma2_start to gamma2 over warmup_epochs."""
+    if warmup_epochs <= 0:
+        return gamma2
+    if warmup_epochs == 1:
+        return gamma2
+    if epoch >= warmup_epochs:
+        return gamma2
+    denom = float(max(warmup_epochs - 1, 1))
+    t = float(epoch) / denom
+    t = max(0.0, min(1.0, t))
+    return gamma2_start + t * (gamma2 - gamma2_start)
+
+
 def compute_happy_boost(epoch, gamma_max, e_boost):
     if e_boost <= 0:
         return 1.0
@@ -294,7 +308,7 @@ def train_or_eval_model(model, loss_function, kl_loss, dataloader, epoch, optimi
                         n_classes=6, happy_class=1, tau_conf=0.8,
                         omega_true_major=0.3, omega_true_happy=0.7,
                         gamma_boost=1.0, happy_class_idx=1,
-                        alpha_recon=0.01, alpha_gate=0.01,
+                        alpha_gate=0.01,
                         use_pseudo_ulgm=True, use_aux_losses=True):
     losses, preds, labels, masks = [], [], [], []
     skipped_non_finite = 0
@@ -323,7 +337,7 @@ def train_or_eval_model(model, loss_function, kl_loss, dataloader, epoch, optimi
             if use_aux_losses:
                 log_prob1, log_prob2, log_prob3, log_prob4, all_log_prob, all_prob, \
                 kl_log_prob1, kl_log_prob2, kl_log_prob3, kl_log_prob4, kl_all_prob, \
-                recon_loss, gate_entropy = model(textf, visuf, acouf, umask, qmask, lengths, rppgf=rppgf, return_aux_losses=True)
+                gate_entropy = model(textf, visuf, acouf, umask, qmask, lengths, rppgf=rppgf, return_aux_losses=True)
             else:
                 log_prob1, log_prob2, log_prob3, log_prob4, all_log_prob, all_prob, \
                 kl_log_prob1, kl_log_prob2, kl_log_prob3, kl_log_prob4, kl_all_prob = model(textf, visuf, acouf, umask, qmask, lengths, rppgf=rppgf)
@@ -331,7 +345,7 @@ def train_or_eval_model(model, loss_function, kl_loss, dataloader, epoch, optimi
             if use_aux_losses:
                 log_prob1, log_prob2, log_prob3, all_log_prob, all_prob, \
                 kl_log_prob1, kl_log_prob2, kl_log_prob3, kl_all_prob, \
-                recon_loss, gate_entropy = model(textf, visuf, acouf, umask, qmask, lengths, return_aux_losses=True)
+                gate_entropy = model(textf, visuf, acouf, umask, qmask, lengths, return_aux_losses=True)
             else:
                 log_prob1, log_prob2, log_prob3, all_log_prob, all_prob, \
                 kl_log_prob1, kl_log_prob2, kl_log_prob3, kl_all_prob = model(textf, visuf, acouf, umask, qmask, lengths)
@@ -409,9 +423,8 @@ def train_or_eval_model(model, loss_function, kl_loss, dataloader, epoch, optimi
                     gamma_3 * (kl_loss(kl_lp_1, kl_p_all, umask) + kl_loss(kl_lp_2, kl_p_all, umask) + kl_loss(kl_lp_3, kl_p_all, umask))
 
         if use_aux_losses:
-            recon_term = alpha_recon * masked_mean(recon_loss.view(-1), umask)
             gate_term = alpha_gate * masked_mean(gate_entropy.view(-1), umask)
-            loss = loss + recon_term + gate_term
+            loss = loss + gate_term
 
         lp_ = all_prob.view(-1, all_prob.size()[2])
 
@@ -507,6 +520,10 @@ if __name__ == '__main__':
     parser.add_argument('--gamma-1', type=float, default=1.0, help='weight for fused NLL task loss')
     parser.add_argument('--gamma-2', type=float, default=1.0, help='weight for ULGM term (multiplied by beta schedule)')
     parser.add_argument('--gamma-3', type=float, default=1.0, help='weight for KL self-distillation term (set 0 to disable)')
+    parser.add_argument('--gamma-2-warmup-epochs', type=int, default=0,
+                        help='linear ramp epochs for gamma_2 from gamma-2-start to gamma-2; 0 disables')
+    parser.add_argument('--gamma-2-start', type=float, default=0.0,
+                        help='initial gamma_2 at epoch 0 when gamma-2-warmup-epochs > 0')
 
     parser.add_argument('--class-weight-mode', type=str, default='paper',
                         choices=['none', 'legacy', 'paper'],
@@ -526,10 +543,9 @@ if __name__ == '__main__':
     parser.add_argument('--happy-boost-max', type=float, default=1.5, help='gamma_max for happy early boosting')
     parser.add_argument('--happy-boost-epochs', type=int, default=10, help='E_boost for happy early boosting')
 
-    parser.add_argument('--alpha-recon', type=float, default=0.01, help='weight for reconstruction loss')
     parser.add_argument('--alpha-gate', type=float, default=0.01, help='weight for multimodal gate entropy regularizer')
     parser.add_argument('--no-aux-losses', action='store_true', default=False,
-                        help='disable recon+gate auxiliary losses')
+                        help='disable multimodal gate entropy auxiliary loss')
 
     args = parser.parse_args()
     validate_ulgm_args(args)
@@ -645,12 +661,15 @@ if __name__ == '__main__':
         beta_e = compute_beta_schedule(
             e, args.ulgm_lambda_min, args.ulgm_lambda_max, args.ulgm_e_delay, args.ulgm_e_ramp
         )
+        gamma2_e = compute_gamma2_schedule(
+            e, args.gamma_2, args.gamma_2_start, args.gamma_2_warmup_epochs
+        )
         gamma_boost_e = compute_happy_boost(e, args.happy_boost_max, args.happy_boost_epochs)
         use_pseudo_ulgm = (args.Dataset == 'IEMOCAP') and (not args.no_pseudo_ulgm)
         use_aux_losses = (not args.no_aux_losses)
         train_loss, train_acc, _, _, _, train_fscore = train_or_eval_model(
             model, loss_function, kl_loss, train_loader, e, optimizer, True,
-            gamma_1=args.gamma_1, gamma_2=args.gamma_2, gamma_3=args.gamma_3,
+            gamma_1=args.gamma_1, gamma_2=gamma2_e, gamma_3=args.gamma_3,
             use_rppg=args.use_rppg, beta_e=beta_e, ulgm_alphas=ulgm_alphas,
             n_classes=n_classes, happy_class=args.iemocap_happy_class,
             tau_conf=args.pseudo_tau_conf,
@@ -658,14 +677,13 @@ if __name__ == '__main__':
             omega_true_happy=args.pseudo_omega_happy,
             gamma_boost=gamma_boost_e,
             happy_class_idx=args.iemocap_happy_class,
-            alpha_recon=args.alpha_recon,
             alpha_gate=args.alpha_gate,
             use_pseudo_ulgm=use_pseudo_ulgm,
             use_aux_losses=use_aux_losses,
         )
         valid_loss, valid_acc, _, _, _, valid_fscore = train_or_eval_model(
             model, loss_function, kl_loss, valid_loader, e,
-            gamma_1=args.gamma_1, gamma_2=args.gamma_2, gamma_3=args.gamma_3,
+            gamma_1=args.gamma_1, gamma_2=gamma2_e, gamma_3=args.gamma_3,
             use_rppg=args.use_rppg, beta_e=beta_e, ulgm_alphas=ulgm_alphas,
             n_classes=n_classes, happy_class=args.iemocap_happy_class,
             tau_conf=args.pseudo_tau_conf,
@@ -673,14 +691,13 @@ if __name__ == '__main__':
             omega_true_happy=args.pseudo_omega_happy,
             gamma_boost=gamma_boost_e,
             happy_class_idx=args.iemocap_happy_class,
-            alpha_recon=args.alpha_recon,
             alpha_gate=args.alpha_gate,
             use_pseudo_ulgm=use_pseudo_ulgm,
             use_aux_losses=use_aux_losses,
         )
         test_loss, test_acc, test_label, test_pred, test_mask, test_fscore = train_or_eval_model(
             model, loss_function, kl_loss, test_loader, e,
-            gamma_1=args.gamma_1, gamma_2=args.gamma_2, gamma_3=args.gamma_3,
+            gamma_1=args.gamma_1, gamma_2=gamma2_e, gamma_3=args.gamma_3,
             use_rppg=args.use_rppg, beta_e=beta_e, ulgm_alphas=ulgm_alphas,
             n_classes=n_classes, happy_class=args.iemocap_happy_class,
             tau_conf=args.pseudo_tau_conf,
@@ -688,7 +705,6 @@ if __name__ == '__main__':
             omega_true_happy=args.pseudo_omega_happy,
             gamma_boost=gamma_boost_e,
             happy_class_idx=args.iemocap_happy_class,
-            alpha_recon=args.alpha_recon,
             alpha_gate=args.alpha_gate,
             use_pseudo_ulgm=use_pseudo_ulgm,
             use_aux_losses=use_aux_losses,
@@ -705,8 +721,8 @@ if __name__ == '__main__':
             writer.add_scalar('train: accuracy', train_acc, e)
             writer.add_scalar('train: fscore', train_fscore, e)
 
-        print('epoch: {}, beta_ulgm: {:.6f}, happy_boost: {:.4f}, train_loss: {}, train_acc: {}, train_fscore: {}, valid_loss: {}, valid_acc: {}, valid_fscore: {}, test_loss: {}, test_acc: {}, test_fscore: {}, time: {} sec'.\
-                format(e+1, beta_e, gamma_boost_e, train_loss, train_acc, train_fscore, valid_loss, valid_acc, valid_fscore, test_loss, test_acc, test_fscore, round(time.time()-start_time, 2)))
+        print('epoch: {}, beta_ulgm: {:.6f}, gamma2: {:.4f}, happy_boost: {:.4f}, train_loss: {}, train_acc: {}, train_fscore: {}, valid_loss: {}, valid_acc: {}, valid_fscore: {}, test_loss: {}, test_acc: {}, test_fscore: {}, time: {} sec'.\
+                format(e+1, beta_e, gamma2_e, gamma_boost_e, train_loss, train_acc, train_fscore, valid_loss, valid_acc, valid_fscore, test_loss, test_acc, test_fscore, round(time.time()-start_time, 2)))
         if (e+1)%10 == 0 and best_label is not None and len(best_label) > 0:
             print(classification_report(best_label, best_pred, sample_weight=best_mask,digits=4))
             print(confusion_matrix(best_label,best_pred,sample_weight=best_mask))

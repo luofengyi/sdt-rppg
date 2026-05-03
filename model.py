@@ -286,10 +286,6 @@ class Transformer_Based_Model(nn.Module):
         # Multimodal-level Gated Fusion
         self.last_gate = Multimodal_GatedFusion(hidden_dim)
 
-        # Reconstruction head: map concatenated modality reps -> fused-like global rep
-        recon_in_dim = hidden_dim * (4 if use_rppg else 3)
-        self.recon_head = nn.Linear(recon_in_dim, hidden_dim, bias=True)
-
         # Emotion Classifier
         self.t_output_layer = nn.Sequential(
             nn.ReLU(),
@@ -388,18 +384,13 @@ class Transformer_Based_Model(nn.Module):
 
         # Multimodal-level Gated Fusion
         if self.use_rppg and rppgf is not None:
-            concat_modal = torch.cat([t_transformer_out, a_transformer_out, v_transformer_out, r_transformer_out], dim=-1)
             all_transformer_out, last_gate_weights = self.last_gate(
                 t_transformer_out, a_transformer_out, v_transformer_out, r_transformer_out, return_gate=True
             )
         else:
-            concat_modal = torch.cat([t_transformer_out, a_transformer_out, v_transformer_out], dim=-1)
             all_transformer_out, last_gate_weights = self.last_gate(
                 t_transformer_out, a_transformer_out, v_transformer_out, return_gate=True
             )
-
-        recon_pred = self.recon_head(concat_modal)
-        recon_loss = F.mse_loss(all_transformer_out, recon_pred, reduction='none').mean(dim=-1, keepdim=False)
 
         eps = 1e-8
         # last_gate_weights comes from Multimodal_GatedFusion softmax; treat it as a nonnegative tensor field
@@ -435,12 +426,12 @@ class Transformer_Based_Model(nn.Module):
             if return_aux_losses:
                 return t_log_prob, a_log_prob, v_log_prob, r_log_prob, all_log_prob, all_prob, \
                        kl_t_log_prob, kl_a_log_prob, kl_v_log_prob, kl_r_log_prob, kl_all_prob, \
-                       recon_loss, gate_entropy
+                       gate_entropy
             return t_log_prob, a_log_prob, v_log_prob, r_log_prob, all_log_prob, all_prob, \
                    kl_t_log_prob, kl_a_log_prob, kl_v_log_prob, kl_r_log_prob, kl_all_prob
         if return_aux_losses:
             return t_log_prob, a_log_prob, v_log_prob, all_log_prob, all_prob, \
                    kl_t_log_prob, kl_a_log_prob, kl_v_log_prob, kl_all_prob, \
-                   recon_loss, gate_entropy
+                   gate_entropy
         return t_log_prob, a_log_prob, v_log_prob, all_log_prob, all_prob, \
                kl_t_log_prob, kl_a_log_prob, kl_v_log_prob, kl_all_prob
