@@ -17,7 +17,10 @@
     "ulgm-normalize-alpha": true,
     "class-weight-mode": "paper",
     "gamma-2-warmup-epochs": 6,
-    "gamma-2-start": 0.2
+    "gamma-2-start": 0.2,
+    "iemocap-sad-class": 1,
+    "iemocap-neutral-class": 2,
+    "class-boost-lambda": 0.2
   },
   "hard_constraints": {
     "enabled": true,
@@ -51,8 +54,13 @@
     "pseudo-tau-conf": [0.75, 0.8],
     "pseudo-omega-major": [0.25, 0.3],
     "pseudo-omega-happy": [0.65, 0.75],
-    "happy-boost-max": [1.6, 1.8],
+    "happy-boost-max": [1.3, 1.5],
     "happy-boost-epochs": [8, 12],
+    "sad-boost-max": [1.15, 1.3],
+    "sad-boost-epochs": [10, 14],
+    "neutral-boost-max": [1.15, 1.3],
+    "neutral-boost-epochs": [10, 14],
+    "class-boost-lambda": [0.1, 0.2, 0.3],
     "alpha-gate": [0.005, 0.01]
   }
 }

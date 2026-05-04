@@ -270,6 +270,20 @@ def compute_happy_boost(epoch, gamma_max, e_boost):
     return float(max(1.0, val))
 
 
+def build_class_boost_weights(labels_flat, happy_class_idx, happy_boost,
+                              sad_class_idx, sad_boost,
+                              neutral_class_idx, neutral_boost):
+    labels_flat = labels_flat.long()
+    w = torch.ones_like(labels_flat, dtype=torch.float32, device=labels_flat.device)
+    if happy_boost > 1.0:
+        w = w + (float(happy_boost) - 1.0) * (labels_flat == int(happy_class_idx)).float()
+    if sad_boost > 1.0:
+        w = w + (float(sad_boost) - 1.0) * (labels_flat == int(sad_class_idx)).float()
+    if neutral_boost > 1.0:
+        w = w + (float(neutral_boost) - 1.0) * (labels_flat == int(neutral_class_idx)).float()
+    return w
+
+
 def masked_mean(x, mask):
     mask = mask.view(-1).float()
     denom = torch.sum(mask) + 1e-8
@@ -317,6 +331,9 @@ def train_or_eval_model(model, loss_function, kl_loss, dataloader, epoch, optimi
                         n_classes=6, happy_class=1, tau_conf=0.8,
                         omega_true_major=0.3, omega_true_happy=0.7,
                         gamma_boost=1.0, happy_class_idx=1,
+                        sad_class_idx=1, sad_boost=1.0,
+                        neutral_class_idx=2, neutral_boost=1.0,
+                        class_boost_lambda=0.0,
                         alpha_gate=0.01,
                         use_pseudo_ulgm=True, use_aux_losses=True):
     losses, preds, labels, masks = [], [], [], []
@@ -364,6 +381,11 @@ def train_or_eval_model(model, loss_function, kl_loss, dataloader, epoch, optimi
         lp_3 = log_prob3.view(-1, log_prob3.size()[2])
         lp_all = all_log_prob.view(-1, all_log_prob.size()[2])
         labels_ = label.view(-1)
+        class_boost_w = build_class_boost_weights(
+            labels_, happy_class_idx, gamma_boost,
+            sad_class_idx, sad_boost,
+            neutral_class_idx, neutral_boost
+        )
 
         kl_lp_1 = kl_log_prob1.view(-1, kl_log_prob1.size()[2])
         kl_lp_2 = kl_log_prob2.view(-1, kl_log_prob2.size()[2])
@@ -384,12 +406,10 @@ def train_or_eval_model(model, loss_function, kl_loss, dataloader, epoch, optimi
                 l3 = unimodal_pseudo_loss_per_pos(lp_3, tgt3, cw, labels_)
                 l4 = unimodal_pseudo_loss_per_pos(lp_4, tgt4, cw, labels_)
 
-                happy_mask = (labels_ == int(happy_class_idx)).float()
-                boost_w = 1.0 + (float(gamma_boost) - 1.0) * happy_mask
-                l1 = l1 * boost_w
-                l2 = l2 * boost_w
-                l3 = l3 * boost_w
-                l4 = l4 * boost_w
+                l1 = l1 * class_boost_w
+                l2 = l2 * class_boost_w
+                l3 = l3 * class_boost_w
+                l4 = l4 * class_boost_w
 
                 ulgm_loss = ulgm_alphas['t'] * masked_mean(l1, umask) + \
                             ulgm_alphas['v'] * masked_mean(l2, umask) + \
@@ -414,11 +434,9 @@ def train_or_eval_model(model, loss_function, kl_loss, dataloader, epoch, optimi
                 l2 = unimodal_pseudo_loss_per_pos(lp_2, tgt2, cw, labels_)
                 l3 = unimodal_pseudo_loss_per_pos(lp_3, tgt3, cw, labels_)
 
-                happy_mask = (labels_ == int(happy_class_idx)).float()
-                boost_w = 1.0 + (float(gamma_boost) - 1.0) * happy_mask
-                l1 = l1 * boost_w
-                l2 = l2 * boost_w
-                l3 = l3 * boost_w
+                l1 = l1 * class_boost_w
+                l2 = l2 * class_boost_w
+                l3 = l3 * class_boost_w
 
                 ulgm_loss = ulgm_alphas['t'] * masked_mean(l1, umask) + \
                             ulgm_alphas['v'] * masked_mean(l2, umask) + \
@@ -434,6 +452,10 @@ def train_or_eval_model(model, loss_function, kl_loss, dataloader, epoch, optimi
         if use_aux_losses:
             gate_term = alpha_gate * masked_mean(gate_entropy.view(-1), umask)
             loss = loss + gate_term
+        if class_boost_lambda > 0:
+            fused_ce = F.nll_loss(lp_all, labels_.long(), reduction='none')
+            boosted_fused_ce = fused_ce * class_boost_w
+            loss = loss + float(class_boost_lambda) * masked_mean(boosted_fused_ce, umask)
 
         lp_ = all_prob.view(-1, all_prob.size()[2])
 
@@ -555,6 +577,16 @@ if __name__ == '__main__':
 
     parser.add_argument('--happy-boost-max', type=float, default=1.5, help='gamma_max for happy early boosting')
     parser.add_argument('--happy-boost-epochs', type=int, default=10, help='E_boost for happy early boosting')
+    parser.add_argument('--iemocap-sad-class', type=int, default=1,
+                        help='IEMOCAP label id treated as Sad for class-focused boosting')
+    parser.add_argument('--sad-boost-max', type=float, default=1.2, help='gamma_max for sad early boosting')
+    parser.add_argument('--sad-boost-epochs', type=int, default=12, help='E_boost for sad early boosting')
+    parser.add_argument('--iemocap-neutral-class', type=int, default=2,
+                        help='IEMOCAP label id treated as Neutral for class-focused boosting')
+    parser.add_argument('--neutral-boost-max', type=float, default=1.2, help='gamma_max for neutral early boosting')
+    parser.add_argument('--neutral-boost-epochs', type=int, default=12, help='E_boost for neutral early boosting')
+    parser.add_argument('--class-boost-lambda', type=float, default=0.2,
+                        help='weight for fused-head class-focused boosting term')
 
     parser.add_argument('--alpha-gate', type=float, default=0.01, help='weight for multimodal gate entropy regularizer')
     parser.add_argument('--no-aux-losses', action='store_true', default=False,
@@ -610,10 +642,14 @@ if __name__ == '__main__':
         n_classes = 4
         iemocap_target_label_map = iemocap_four_class_map
         effective_happy_class = iemocap_four_class_map.get(args.iemocap_happy_class, 0)
+        effective_sad_class = iemocap_four_class_map.get(args.iemocap_sad_class, 1)
+        effective_neutral_class = iemocap_four_class_map.get(args.iemocap_neutral_class, 2)
     else:
         n_classes = 7 if args.Dataset == 'MELD' else 6 if args.Dataset == 'IEMOCAP' else 1
         iemocap_target_label_map = None
         effective_happy_class = args.iemocap_happy_class
+        effective_sad_class = args.iemocap_sad_class
+        effective_neutral_class = args.iemocap_neutral_class
 
     print('temp {}'.format(args.temp))
     ulgm_alphas = build_ulgm_alphas(args)
@@ -698,6 +734,8 @@ if __name__ == '__main__':
             e, args.gamma_2, args.gamma_2_start, args.gamma_2_warmup_epochs
         )
         gamma_boost_e = compute_happy_boost(e, args.happy_boost_max, args.happy_boost_epochs)
+        sad_boost_e = compute_happy_boost(e, args.sad_boost_max, args.sad_boost_epochs)
+        neutral_boost_e = compute_happy_boost(e, args.neutral_boost_max, args.neutral_boost_epochs)
         use_pseudo_ulgm = (args.Dataset == 'IEMOCAP') and (not args.no_pseudo_ulgm)
         use_aux_losses = (not args.no_aux_losses)
         train_loss, train_acc, _, _, _, train_fscore = train_or_eval_model(
@@ -710,6 +748,11 @@ if __name__ == '__main__':
             omega_true_happy=args.pseudo_omega_happy,
             gamma_boost=gamma_boost_e,
             happy_class_idx=effective_happy_class,
+            sad_class_idx=effective_sad_class,
+            sad_boost=sad_boost_e,
+            neutral_class_idx=effective_neutral_class,
+            neutral_boost=neutral_boost_e,
+            class_boost_lambda=args.class_boost_lambda,
             alpha_gate=args.alpha_gate,
             use_pseudo_ulgm=use_pseudo_ulgm,
             use_aux_losses=use_aux_losses,
@@ -728,6 +771,11 @@ if __name__ == '__main__':
                 omega_true_happy=args.pseudo_omega_happy,
                 gamma_boost=gamma_boost_e,
                 happy_class_idx=effective_happy_class,
+                sad_class_idx=effective_sad_class,
+                sad_boost=sad_boost_e,
+                neutral_class_idx=effective_neutral_class,
+                neutral_boost=neutral_boost_e,
+                class_boost_lambda=args.class_boost_lambda,
                 alpha_gate=args.alpha_gate,
                 use_pseudo_ulgm=use_pseudo_ulgm,
                 use_aux_losses=use_aux_losses,
@@ -742,6 +790,11 @@ if __name__ == '__main__':
             omega_true_happy=args.pseudo_omega_happy,
             gamma_boost=gamma_boost_e,
             happy_class_idx=effective_happy_class,
+            sad_class_idx=effective_sad_class,
+            sad_boost=sad_boost_e,
+            neutral_class_idx=effective_neutral_class,
+            neutral_boost=neutral_boost_e,
+            class_boost_lambda=args.class_boost_lambda,
             alpha_gate=args.alpha_gate,
             use_pseudo_ulgm=use_pseudo_ulgm,
             use_aux_losses=use_aux_losses,
@@ -758,8 +811,8 @@ if __name__ == '__main__':
             writer.add_scalar('train: accuracy', train_acc, e)
             writer.add_scalar('train: fscore', train_fscore, e)
 
-        print('epoch: {}, beta_ulgm: {:.6f}, gamma2: {:.4f}, happy_boost: {:.4f}, train_loss: {}, train_acc: {}, train_fscore: {}, valid_loss: {}, valid_acc: {}, valid_fscore: {}, test_loss: {}, test_acc: {}, test_fscore: {}, time: {} sec'.\
-                format(e+1, beta_e, gamma2_e, gamma_boost_e, train_loss, train_acc, train_fscore, valid_loss, valid_acc, valid_fscore, test_loss, test_acc, test_fscore, round(time.time()-start_time, 2)))
+        print('epoch: {}, beta_ulgm: {:.6f}, gamma2: {:.4f}, happy_boost: {:.4f}, sad_boost: {:.4f}, neutral_boost: {:.4f}, train_loss: {}, train_acc: {}, train_fscore: {}, valid_loss: {}, valid_acc: {}, valid_fscore: {}, test_loss: {}, test_acc: {}, test_fscore: {}, time: {} sec'.\
+                format(e+1, beta_e, gamma2_e, gamma_boost_e, sad_boost_e, neutral_boost_e, train_loss, train_acc, train_fscore, valid_loss, valid_acc, valid_fscore, test_loss, test_acc, test_fscore, round(time.time()-start_time, 2)))
         if (e+1)%10 == 0 and best_label is not None and len(best_label) > 0:
             print(classification_report(
                 best_label, best_pred, labels=report_labels, target_names=report_target_names,
