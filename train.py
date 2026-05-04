@@ -116,13 +116,20 @@ def get_IEMOCAP_loaders(iemocap_pkl_path='data/iemocap_multimodal_features.pkl',
     all_idx = list(range(size))
     valid_size = int(valid * size)
     test_size = int(test * size)
-    if size > 0 and test_size == 0:
+    if test > 0 and size > 0 and test_size == 0:
         test_size = 1
-    if size > 1 and valid_size == 0:
+    if valid > 0 and size > 1 and valid_size == 0:
         valid_size = 1
-    if valid_size + test_size >= size and size > 2:
-        test_size = max(1, min(test_size, size - 2))
-        valid_size = max(1, min(valid_size, size - test_size - 1))
+    if valid_size + test_size >= size and size > 0:
+        max_reserved = max(size - 1, 0)
+        reserved = min(valid_size + test_size, max_reserved)
+        if reserved < (valid_size + test_size):
+            overflow = (valid_size + test_size) - reserved
+            trim_valid = min(valid_size, overflow)
+            valid_size -= trim_valid
+            overflow -= trim_valid
+            if overflow > 0:
+                test_size = max(0, test_size - overflow)
 
     idx2label_set = {i: set(fullset.videoLabels[fullset.keys[i]]) for i in all_idx}
 
@@ -539,10 +546,12 @@ if __name__ == '__main__':
     parser.add_argument('--pseudo-tau-conf', type=float, default=0.8, help='confidence threshold for happy pseudo mixing')
     parser.add_argument('--pseudo-omega-major', type=float, default=0.3, help='omega_true for non-happy rows in mixing')
     parser.add_argument('--pseudo-omega-happy', type=float, default=0.7, help='omega_true for happy rows when mixing triggers')
-    parser.add_argument('--iemocap-happy-class', type=int, default=1,
+    parser.add_argument('--iemocap-happy-class', type=int, default=0,
                         help='IEMOCAP label id treated as Happy for pseudo/boosting (dataset-specific)')
     parser.add_argument('--iemocap-six-class', action='store_true', default=False,
                         help='disable 4-class focus and keep original IEMOCAP 6-class setup')
+    parser.add_argument('--iemocap-no-valid-split', action='store_true', default=False,
+                        help='set valid split to 0 and train with all non-test samples')
 
     parser.add_argument('--happy-boost-max', type=float, default=1.5, help='gamma_max for happy early boosting')
     parser.add_argument('--happy-boost-epochs', type=int, default=10, help='E_boost for happy early boosting')
@@ -562,10 +571,17 @@ if __name__ == '__main__':
         print('IEMOCAP sessions: {}'.format(args.iemocap_session_prefixes))
         print('Use rPPG branch: {}'.format(args.use_rppg))
         print('IEMOCAP 4-class focus: {}'.format(not args.iemocap_six_class))
+        if args.iemocap_no_valid_split:
+            print('IEMOCAP valid split disabled: train uses all non-test samples')
         if not args.iemocap_six_class:
-            print('IEMOCAP class map: hap->0, sad->1, neu->2, ang->3')
+            print('IEMOCAP class map: 0->0, 1->1, 2->2, 3->3 (keep original ids)')
         if args.use_rppg:
             print('IEMOCAP rPPG npz: {}'.format(args.iemocap_rppg_npz_path))
+    report_labels = None
+    report_target_names = None
+    if args.Dataset == 'IEMOCAP' and (not args.iemocap_six_class):
+        report_labels = [0, 1, 2, 3]
+        report_target_names = ['happy', 'sad', 'neutral', 'angry']
 
     args.cuda = torch.cuda.is_available() and not args.no_cuda
     if args.cuda:
@@ -589,7 +605,7 @@ if __name__ == '__main__':
     D_m = D_audio + D_visual + D_text
 
     n_speakers = 9 if args.Dataset=='MELD' else 2
-    iemocap_four_class_map = {1: 0, 2: 1, 3: 2, 0: 3}  # hap,sad,neu,ang
+    iemocap_four_class_map = {0: 0, 1: 1, 2: 2, 3: 3}  # keep original 0/1/2/3 ids
     if args.Dataset == 'IEMOCAP' and (not args.iemocap_six_class):
         n_classes = 4
         iemocap_target_label_map = iemocap_four_class_map
@@ -632,11 +648,12 @@ if __name__ == '__main__':
                                                                     num_workers=0)
     elif args.Dataset == 'IEMOCAP':
         iemocap_session_prefixes = [x.strip() for x in args.iemocap_session_prefixes.split(',') if x.strip()]
+        valid_ratio_effective = 0.0 if args.iemocap_no_valid_split else args.valid_ratio
         train_loader, valid_loader, test_loader = get_IEMOCAP_loaders(iemocap_pkl_path=args.iemocap_pkl_path,
                                                                       session_prefixes=iemocap_session_prefixes,
                                                                       use_rppg=args.use_rppg,
                                                                       rppg_npz_path=args.iemocap_rppg_npz_path,
-                                                                      valid=args.valid_ratio,
+                                                                      valid=valid_ratio_effective,
                                                                       test=args.test_ratio,
                                                                       split_seed=args.split_seed,
                                                                       split_max_tries=args.split_max_tries,
@@ -697,20 +714,24 @@ if __name__ == '__main__':
             use_pseudo_ulgm=use_pseudo_ulgm,
             use_aux_losses=use_aux_losses,
         )
-        valid_loss, valid_acc, _, _, _, valid_fscore = train_or_eval_model(
-            model, loss_function, kl_loss, valid_loader, e,
-            gamma_1=args.gamma_1, gamma_2=gamma2_e, gamma_3=args.gamma_3,
-            use_rppg=args.use_rppg, beta_e=beta_e, ulgm_alphas=ulgm_alphas,
-            n_classes=n_classes, happy_class=effective_happy_class,
-            tau_conf=args.pseudo_tau_conf,
-            omega_true_major=args.pseudo_omega_major,
-            omega_true_happy=args.pseudo_omega_happy,
-            gamma_boost=gamma_boost_e,
-            happy_class_idx=effective_happy_class,
-            alpha_gate=args.alpha_gate,
-            use_pseudo_ulgm=use_pseudo_ulgm,
-            use_aux_losses=use_aux_losses,
-        )
+        valid_indices = getattr(getattr(valid_loader, 'sampler', None), 'indices', None)
+        if valid_indices is not None and len(valid_indices) == 0:
+            valid_loss, valid_acc, valid_fscore = train_loss, train_acc, train_fscore
+        else:
+            valid_loss, valid_acc, _, _, _, valid_fscore = train_or_eval_model(
+                model, loss_function, kl_loss, valid_loader, e,
+                gamma_1=args.gamma_1, gamma_2=gamma2_e, gamma_3=args.gamma_3,
+                use_rppg=args.use_rppg, beta_e=beta_e, ulgm_alphas=ulgm_alphas,
+                n_classes=n_classes, happy_class=effective_happy_class,
+                tau_conf=args.pseudo_tau_conf,
+                omega_true_major=args.pseudo_omega_major,
+                omega_true_happy=args.pseudo_omega_happy,
+                gamma_boost=gamma_boost_e,
+                happy_class_idx=effective_happy_class,
+                alpha_gate=args.alpha_gate,
+                use_pseudo_ulgm=use_pseudo_ulgm,
+                use_aux_losses=use_aux_losses,
+            )
         test_loss, test_acc, test_label, test_pred, test_mask, test_fscore = train_or_eval_model(
             model, loss_function, kl_loss, test_loader, e,
             gamma_1=args.gamma_1, gamma_2=gamma2_e, gamma_3=args.gamma_3,
@@ -740,7 +761,10 @@ if __name__ == '__main__':
         print('epoch: {}, beta_ulgm: {:.6f}, gamma2: {:.4f}, happy_boost: {:.4f}, train_loss: {}, train_acc: {}, train_fscore: {}, valid_loss: {}, valid_acc: {}, valid_fscore: {}, test_loss: {}, test_acc: {}, test_fscore: {}, time: {} sec'.\
                 format(e+1, beta_e, gamma2_e, gamma_boost_e, train_loss, train_acc, train_fscore, valid_loss, valid_acc, valid_fscore, test_loss, test_acc, test_fscore, round(time.time()-start_time, 2)))
         if (e+1)%10 == 0 and best_label is not None and len(best_label) > 0:
-            print(classification_report(best_label, best_pred, sample_weight=best_mask,digits=4))
+            print(classification_report(
+                best_label, best_pred, labels=report_labels, target_names=report_target_names,
+                sample_weight=best_mask, digits=4
+            ))
             print(confusion_matrix(best_label,best_pred,sample_weight=best_mask))
 
 
@@ -762,7 +786,10 @@ if __name__ == '__main__':
     else:
         record[key_] = [max(all_fscore)]
     if best_label is not None and len(best_label) > 0:
-        best_report = classification_report(best_label, best_pred, sample_weight=best_mask,digits=4)
+        best_report = classification_report(
+            best_label, best_pred, labels=report_labels, target_names=report_target_names,
+            sample_weight=best_mask, digits=4
+        )
     else:
         best_report = 'No non-empty test split after filtering; classification report skipped.'
     if record.get(key_+'record', False):
@@ -773,7 +800,10 @@ if __name__ == '__main__':
         pk.dump(record, f)
 
     if best_label is not None and len(best_label) > 0:
-        print(classification_report(best_label, best_pred, sample_weight=best_mask,digits=4))
+        print(classification_report(
+            best_label, best_pred, labels=report_labels, target_names=report_target_names,
+            sample_weight=best_mask, digits=4
+        ))
         print(confusion_matrix(best_label,best_pred,sample_weight=best_mask))
     else:
         print('No non-empty test split after filtering; skipped classification report and confusion matrix.')
