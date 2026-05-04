@@ -106,10 +106,12 @@ def get_IEMOCAP_loaders(iemocap_pkl_path='data/iemocap_multimodal_features.pkl',
                         use_rppg=False,
                         rppg_npz_path='data/iemocap_rppg_features_ses01_v3.npz',
                         batch_size=32, valid=0.1, test=0.1, split_seed=42, split_max_tries=200,
-                        n_classes=6, num_workers=0, pin_memory=False):
+                        n_classes=6, num_workers=0, pin_memory=False,
+                        target_label_map=None):
     # Build on the same filtered pool so all modalities (including rPPG) share identical split.
     fullset = IEMOCAPDataset(path=iemocap_pkl_path, split='all', session_prefixes=session_prefixes,
-                              use_rppg=use_rppg, rppg_npz_path=rppg_npz_path)
+                              use_rppg=use_rppg, rppg_npz_path=rppg_npz_path,
+                              target_label_map=target_label_map)
     size = len(fullset)
     all_idx = list(range(size))
     valid_size = int(valid * size)
@@ -539,6 +541,8 @@ if __name__ == '__main__':
     parser.add_argument('--pseudo-omega-happy', type=float, default=0.7, help='omega_true for happy rows when mixing triggers')
     parser.add_argument('--iemocap-happy-class', type=int, default=1,
                         help='IEMOCAP label id treated as Happy for pseudo/boosting (dataset-specific)')
+    parser.add_argument('--iemocap-six-class', action='store_true', default=False,
+                        help='disable 4-class focus and keep original IEMOCAP 6-class setup')
 
     parser.add_argument('--happy-boost-max', type=float, default=1.5, help='gamma_max for happy early boosting')
     parser.add_argument('--happy-boost-epochs', type=int, default=10, help='E_boost for happy early boosting')
@@ -557,6 +561,9 @@ if __name__ == '__main__':
         print('IEMOCAP feature pkl: {}'.format(args.iemocap_pkl_path))
         print('IEMOCAP sessions: {}'.format(args.iemocap_session_prefixes))
         print('Use rPPG branch: {}'.format(args.use_rppg))
+        print('IEMOCAP 4-class focus: {}'.format(not args.iemocap_six_class))
+        if not args.iemocap_six_class:
+            print('IEMOCAP class map: hap->0, sad->1, neu->2, ang->3')
         if args.use_rppg:
             print('IEMOCAP rPPG npz: {}'.format(args.iemocap_rppg_npz_path))
 
@@ -582,7 +589,15 @@ if __name__ == '__main__':
     D_m = D_audio + D_visual + D_text
 
     n_speakers = 9 if args.Dataset=='MELD' else 2
-    n_classes = 7 if args.Dataset=='MELD' else 6 if args.Dataset=='IEMOCAP' else 1
+    iemocap_four_class_map = {1: 0, 2: 1, 3: 2, 0: 3}  # hap,sad,neu,ang
+    if args.Dataset == 'IEMOCAP' and (not args.iemocap_six_class):
+        n_classes = 4
+        iemocap_target_label_map = iemocap_four_class_map
+        effective_happy_class = iemocap_four_class_map.get(args.iemocap_happy_class, 0)
+    else:
+        n_classes = 7 if args.Dataset == 'MELD' else 6 if args.Dataset == 'IEMOCAP' else 1
+        iemocap_target_label_map = None
+        effective_happy_class = args.iemocap_happy_class
 
     print('temp {}'.format(args.temp))
     ulgm_alphas = build_ulgm_alphas(args)
@@ -626,6 +641,7 @@ if __name__ == '__main__':
                                                                       split_seed=args.split_seed,
                                                                       split_max_tries=args.split_max_tries,
                                                                       n_classes=n_classes,
+                                                                      target_label_map=iemocap_target_label_map,
                                                                       batch_size=batch_size,
                                                                       num_workers=0)
         if args.class_weight_mode == 'none':
@@ -671,12 +687,12 @@ if __name__ == '__main__':
             model, loss_function, kl_loss, train_loader, e, optimizer, True,
             gamma_1=args.gamma_1, gamma_2=gamma2_e, gamma_3=args.gamma_3,
             use_rppg=args.use_rppg, beta_e=beta_e, ulgm_alphas=ulgm_alphas,
-            n_classes=n_classes, happy_class=args.iemocap_happy_class,
+            n_classes=n_classes, happy_class=effective_happy_class,
             tau_conf=args.pseudo_tau_conf,
             omega_true_major=args.pseudo_omega_major,
             omega_true_happy=args.pseudo_omega_happy,
             gamma_boost=gamma_boost_e,
-            happy_class_idx=args.iemocap_happy_class,
+            happy_class_idx=effective_happy_class,
             alpha_gate=args.alpha_gate,
             use_pseudo_ulgm=use_pseudo_ulgm,
             use_aux_losses=use_aux_losses,
@@ -685,12 +701,12 @@ if __name__ == '__main__':
             model, loss_function, kl_loss, valid_loader, e,
             gamma_1=args.gamma_1, gamma_2=gamma2_e, gamma_3=args.gamma_3,
             use_rppg=args.use_rppg, beta_e=beta_e, ulgm_alphas=ulgm_alphas,
-            n_classes=n_classes, happy_class=args.iemocap_happy_class,
+            n_classes=n_classes, happy_class=effective_happy_class,
             tau_conf=args.pseudo_tau_conf,
             omega_true_major=args.pseudo_omega_major,
             omega_true_happy=args.pseudo_omega_happy,
             gamma_boost=gamma_boost_e,
-            happy_class_idx=args.iemocap_happy_class,
+            happy_class_idx=effective_happy_class,
             alpha_gate=args.alpha_gate,
             use_pseudo_ulgm=use_pseudo_ulgm,
             use_aux_losses=use_aux_losses,
@@ -699,12 +715,12 @@ if __name__ == '__main__':
             model, loss_function, kl_loss, test_loader, e,
             gamma_1=args.gamma_1, gamma_2=gamma2_e, gamma_3=args.gamma_3,
             use_rppg=args.use_rppg, beta_e=beta_e, ulgm_alphas=ulgm_alphas,
-            n_classes=n_classes, happy_class=args.iemocap_happy_class,
+            n_classes=n_classes, happy_class=effective_happy_class,
             tau_conf=args.pseudo_tau_conf,
             omega_true_major=args.pseudo_omega_major,
             omega_true_happy=args.pseudo_omega_happy,
             gamma_boost=gamma_boost_e,
-            happy_class_idx=args.iemocap_happy_class,
+            happy_class_idx=effective_happy_class,
             alpha_gate=args.alpha_gate,
             use_pseudo_ulgm=use_pseudo_ulgm,
             use_aux_losses=use_aux_losses,

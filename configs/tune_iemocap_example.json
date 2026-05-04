@@ -5,6 +5,7 @@
     "Dataset": "IEMOCAP",
     "iemocap-pkl-path": "data/iemocap_multimodal_features_rppg_ses01_v3.pkl",
     "iemocap-session-prefixes": "Ses01",
+    "iemocap-six-class": false,
     "epochs": 60,
     "temp": 1,
     "split-seed": 42,

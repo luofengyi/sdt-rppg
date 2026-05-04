@@ -7,7 +7,8 @@ import numpy as np
 
 class IEMOCAPDataset(Dataset):
     def __init__(self, path='data/iemocap_multimodal_features.pkl', train=True, split='train', session_prefixes=None,
-                 use_rppg=False, rppg_npz_path='data/iemocap_rppg_features_ses01_v3.npz'):
+                 use_rppg=False, rppg_npz_path='data/iemocap_rppg_features_ses01_v3.npz',
+                 target_label_map=None):
         self.videoIDs, self.videoSpeakers, self.videoLabels, self.videoText,\
         self.roberta2, self.roberta3, self.roberta4, \
         self.videoAudio, self.videoVisual, self.videoSentence, self.trainVid,\
@@ -25,11 +26,58 @@ class IEMOCAPDataset(Dataset):
         else:
             self.keys = [x for x in all_keys if any(x.startswith(prefix) for prefix in session_prefixes)]
 
+        self.target_label_map = target_label_map
+        self._kept_utter_indices = {}
+        if self.target_label_map is not None:
+            filtered_keys = []
+            remapped_labels = {}
+            remapped_text = {}
+            remapped_audio = {}
+            remapped_visual = {}
+            remapped_speakers = {}
+            remapped_sentences = {}
+            for vid in self.keys:
+                old_labels = self.videoLabels[vid]
+                keep_idx = [i for i, y in enumerate(old_labels) if int(y) in self.target_label_map]
+                if len(keep_idx) == 0:
+                    continue
+                filtered_keys.append(vid)
+                self._kept_utter_indices[vid] = keep_idx
+                remapped_labels[vid] = [int(self.target_label_map[int(old_labels[i])]) for i in keep_idx]
+                remapped_text[vid] = [self.videoText[vid][i] for i in keep_idx]
+                remapped_audio[vid] = [self.videoAudio[vid][i] for i in keep_idx]
+                remapped_visual[vid] = [self.videoVisual[vid][i] for i in keep_idx]
+                remapped_speakers[vid] = [self.videoSpeakers[vid][i] for i in keep_idx]
+                remapped_sentences[vid] = [self.videoSentence[vid][i] for i in keep_idx]
+            self.keys = filtered_keys
+            self.videoLabels = remapped_labels
+            self.videoText = remapped_text
+            self.videoAudio = remapped_audio
+            self.videoVisual = remapped_visual
+            self.videoSpeakers = remapped_speakers
+            self.videoSentence = remapped_sentences
+
         self.use_rppg = use_rppg
         self.videoRppg = {}
         if self.use_rppg:
             pack = np.load(rppg_npz_path, allow_pickle=True)
-            self.videoRppg = pack['videoRppg342'].item()
+            raw_rppg = pack['videoRppg342'].item()
+            if self.target_label_map is not None:
+                for vid in self.keys:
+                    keep_idx = self._kept_utter_indices[vid]
+                    full_rppg = np.asarray(
+                        raw_rppg.get(vid, np.zeros((max(keep_idx) + 1, 342), dtype=np.float32)),
+                        dtype=np.float32
+                    )
+                    selected = []
+                    for idx in keep_idx:
+                        if idx < len(full_rppg):
+                            selected.append(full_rppg[idx])
+                        else:
+                            selected.append(np.zeros((342,), dtype=np.float32))
+                    self.videoRppg[vid] = np.asarray(selected, dtype=np.float32)
+            else:
+                self.videoRppg = raw_rppg
 
         self.len = len(self.keys)
 
