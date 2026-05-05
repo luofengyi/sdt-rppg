@@ -335,7 +335,8 @@ def train_or_eval_model(model, loss_function, kl_loss, dataloader, epoch, optimi
                         neutral_class_idx=2, neutral_boost=1.0,
                         class_boost_lambda=0.0,
                         alpha_gate=0.01,
-                        use_pseudo_ulgm=True, use_aux_losses=True):
+                        use_pseudo_ulgm=True, use_aux_losses=True,
+                        train_strategy='original'):
     losses, preds, labels, masks = [], [], [], []
     skipped_non_finite = 0
 
@@ -381,81 +382,109 @@ def train_or_eval_model(model, loss_function, kl_loss, dataloader, epoch, optimi
         lp_3 = log_prob3.view(-1, log_prob3.size()[2])
         lp_all = all_log_prob.view(-1, all_log_prob.size()[2])
         labels_ = label.view(-1)
-        class_boost_w = build_class_boost_weights(
-            labels_, happy_class_idx, gamma_boost,
-            sad_class_idx, sad_boost,
-            neutral_class_idx, neutral_boost
-        )
 
         kl_lp_1 = kl_log_prob1.view(-1, kl_log_prob1.size()[2])
         kl_lp_2 = kl_log_prob2.view(-1, kl_log_prob2.size()[2])
         kl_lp_3 = kl_log_prob3.view(-1, kl_log_prob3.size()[2])
         kl_p_all = kl_all_prob.view(-1, kl_all_prob.size()[2])
+        lp_4 = None
+        kl_lp_4 = None
         if use_rppg:
             lp_4 = log_prob4.view(-1, log_prob4.size()[2])
             kl_lp_4 = kl_log_prob4.view(-1, kl_log_prob4.size()[2])
-            if use_pseudo_ulgm:
-                cw = getattr(loss_function, 'weight', None)
-                tgt1, _ = build_pseudo_targets_for_modality(lp_1, labels_, n_classes, happy_class, tau_conf, omega_true_major, omega_true_happy)
-                tgt2, _ = build_pseudo_targets_for_modality(lp_2, labels_, n_classes, happy_class, tau_conf, omega_true_major, omega_true_happy)
-                tgt3, _ = build_pseudo_targets_for_modality(lp_3, labels_, n_classes, happy_class, tau_conf, omega_true_major, omega_true_happy)
-                tgt4, _ = build_pseudo_targets_for_modality(lp_4, labels_, n_classes, happy_class, tau_conf, omega_true_major, omega_true_happy)
 
-                l1 = unimodal_pseudo_loss_per_pos(lp_1, tgt1, cw, labels_)
-                l2 = unimodal_pseudo_loss_per_pos(lp_2, tgt2, cw, labels_)
-                l3 = unimodal_pseudo_loss_per_pos(lp_3, tgt3, cw, labels_)
-                l4 = unimodal_pseudo_loss_per_pos(lp_4, tgt4, cw, labels_)
+        if train_strategy == 'original':
+            # 1:1:1 = fused-head CE + unimodal CE(avg) + self-distillation(KL avg)
+            num_modalities = 4 if use_rppg else 3
 
-                l1 = l1 * class_boost_w
-                l2 = l2 * class_boost_w
-                l3 = l3 * class_boost_w
-                l4 = l4 * class_boost_w
+            loss_main = loss_function(lp_all, labels_, umask)
 
-                ulgm_loss = ulgm_alphas['t'] * masked_mean(l1, umask) + \
-                            ulgm_alphas['v'] * masked_mean(l2, umask) + \
-                            ulgm_alphas['a'] * masked_mean(l3, umask) + \
-                            ulgm_alphas['r'] * masked_mean(l4, umask)
-            else:
-                ulgm_loss = ulgm_alphas['t'] * loss_function(lp_1, labels_, umask) + \
-                            ulgm_alphas['v'] * loss_function(lp_2, labels_, umask) + \
-                            ulgm_alphas['a'] * loss_function(lp_3, labels_, umask) + \
-                            ulgm_alphas['r'] * loss_function(lp_4, labels_, umask)
-            loss = gamma_1 * loss_function(lp_all, labels_, umask) + \
-                    gamma_2 * beta_e * ulgm_loss + \
-                    gamma_3 * (kl_loss(kl_lp_1, kl_p_all, umask) + kl_loss(kl_lp_2, kl_p_all, umask) + kl_loss(kl_lp_3, kl_p_all, umask) + kl_loss(kl_lp_4, kl_p_all, umask))
+            unimodal_losses = [
+                loss_function(lp_1, labels_, umask),
+                loss_function(lp_2, labels_, umask),
+                loss_function(lp_3, labels_, umask),
+            ]
+            kd_losses = [
+                kl_loss(kl_lp_1, kl_p_all, umask),
+                kl_loss(kl_lp_2, kl_p_all, umask),
+                kl_loss(kl_lp_3, kl_p_all, umask),
+            ]
+            if use_rppg:
+                unimodal_losses.append(loss_function(lp_4, labels_, umask))
+                kd_losses.append(kl_loss(kl_lp_4, kl_p_all, umask))
+
+            loss_uni = sum(unimodal_losses) / float(num_modalities)
+            loss_kd = sum(kd_losses) / float(num_modalities)
+            loss = loss_main + loss_uni + loss_kd
         else:
-            if use_pseudo_ulgm:
-                cw = getattr(loss_function, 'weight', None)
-                tgt1, _ = build_pseudo_targets_for_modality(lp_1, labels_, n_classes, happy_class, tau_conf, omega_true_major, omega_true_happy)
-                tgt2, _ = build_pseudo_targets_for_modality(lp_2, labels_, n_classes, happy_class, tau_conf, omega_true_major, omega_true_happy)
-                tgt3, _ = build_pseudo_targets_for_modality(lp_3, labels_, n_classes, happy_class, tau_conf, omega_true_major, omega_true_happy)
+            class_boost_w = build_class_boost_weights(
+                labels_, happy_class_idx, gamma_boost,
+                sad_class_idx, sad_boost,
+                neutral_class_idx, neutral_boost
+            )
+            if use_rppg:
+                if use_pseudo_ulgm:
+                    cw = getattr(loss_function, 'weight', None)
+                    tgt1, _ = build_pseudo_targets_for_modality(lp_1, labels_, n_classes, happy_class, tau_conf, omega_true_major, omega_true_happy)
+                    tgt2, _ = build_pseudo_targets_for_modality(lp_2, labels_, n_classes, happy_class, tau_conf, omega_true_major, omega_true_happy)
+                    tgt3, _ = build_pseudo_targets_for_modality(lp_3, labels_, n_classes, happy_class, tau_conf, omega_true_major, omega_true_happy)
+                    tgt4, _ = build_pseudo_targets_for_modality(lp_4, labels_, n_classes, happy_class, tau_conf, omega_true_major, omega_true_happy)
 
-                l1 = unimodal_pseudo_loss_per_pos(lp_1, tgt1, cw, labels_)
-                l2 = unimodal_pseudo_loss_per_pos(lp_2, tgt2, cw, labels_)
-                l3 = unimodal_pseudo_loss_per_pos(lp_3, tgt3, cw, labels_)
+                    l1 = unimodal_pseudo_loss_per_pos(lp_1, tgt1, cw, labels_)
+                    l2 = unimodal_pseudo_loss_per_pos(lp_2, tgt2, cw, labels_)
+                    l3 = unimodal_pseudo_loss_per_pos(lp_3, tgt3, cw, labels_)
+                    l4 = unimodal_pseudo_loss_per_pos(lp_4, tgt4, cw, labels_)
 
-                l1 = l1 * class_boost_w
-                l2 = l2 * class_boost_w
-                l3 = l3 * class_boost_w
+                    l1 = l1 * class_boost_w
+                    l2 = l2 * class_boost_w
+                    l3 = l3 * class_boost_w
+                    l4 = l4 * class_boost_w
 
-                ulgm_loss = ulgm_alphas['t'] * masked_mean(l1, umask) + \
-                            ulgm_alphas['v'] * masked_mean(l2, umask) + \
-                            ulgm_alphas['a'] * masked_mean(l3, umask)
+                    ulgm_loss = ulgm_alphas['t'] * masked_mean(l1, umask) + \
+                                ulgm_alphas['v'] * masked_mean(l2, umask) + \
+                                ulgm_alphas['a'] * masked_mean(l3, umask) + \
+                                ulgm_alphas['r'] * masked_mean(l4, umask)
+                else:
+                    ulgm_loss = ulgm_alphas['t'] * loss_function(lp_1, labels_, umask) + \
+                                ulgm_alphas['v'] * loss_function(lp_2, labels_, umask) + \
+                                ulgm_alphas['a'] * loss_function(lp_3, labels_, umask) + \
+                                ulgm_alphas['r'] * loss_function(lp_4, labels_, umask)
+                loss = gamma_1 * loss_function(lp_all, labels_, umask) + \
+                        gamma_2 * beta_e * ulgm_loss + \
+                        gamma_3 * (kl_loss(kl_lp_1, kl_p_all, umask) + kl_loss(kl_lp_2, kl_p_all, umask) + kl_loss(kl_lp_3, kl_p_all, umask) + kl_loss(kl_lp_4, kl_p_all, umask))
             else:
-                ulgm_loss = ulgm_alphas['t'] * loss_function(lp_1, labels_, umask) + \
-                            ulgm_alphas['v'] * loss_function(lp_2, labels_, umask) + \
-                            ulgm_alphas['a'] * loss_function(lp_3, labels_, umask)
-            loss = gamma_1 * loss_function(lp_all, labels_, umask) + \
-                    gamma_2 * beta_e * ulgm_loss + \
-                    gamma_3 * (kl_loss(kl_lp_1, kl_p_all, umask) + kl_loss(kl_lp_2, kl_p_all, umask) + kl_loss(kl_lp_3, kl_p_all, umask))
+                if use_pseudo_ulgm:
+                    cw = getattr(loss_function, 'weight', None)
+                    tgt1, _ = build_pseudo_targets_for_modality(lp_1, labels_, n_classes, happy_class, tau_conf, omega_true_major, omega_true_happy)
+                    tgt2, _ = build_pseudo_targets_for_modality(lp_2, labels_, n_classes, happy_class, tau_conf, omega_true_major, omega_true_happy)
+                    tgt3, _ = build_pseudo_targets_for_modality(lp_3, labels_, n_classes, happy_class, tau_conf, omega_true_major, omega_true_happy)
 
-        if use_aux_losses:
-            gate_term = alpha_gate * masked_mean(gate_entropy.view(-1), umask)
-            loss = loss + gate_term
-        if class_boost_lambda > 0:
-            fused_ce = F.nll_loss(lp_all, labels_.long(), reduction='none')
-            boosted_fused_ce = fused_ce * class_boost_w
-            loss = loss + float(class_boost_lambda) * masked_mean(boosted_fused_ce, umask)
+                    l1 = unimodal_pseudo_loss_per_pos(lp_1, tgt1, cw, labels_)
+                    l2 = unimodal_pseudo_loss_per_pos(lp_2, tgt2, cw, labels_)
+                    l3 = unimodal_pseudo_loss_per_pos(lp_3, tgt3, cw, labels_)
+
+                    l1 = l1 * class_boost_w
+                    l2 = l2 * class_boost_w
+                    l3 = l3 * class_boost_w
+
+                    ulgm_loss = ulgm_alphas['t'] * masked_mean(l1, umask) + \
+                                ulgm_alphas['v'] * masked_mean(l2, umask) + \
+                                ulgm_alphas['a'] * masked_mean(l3, umask)
+                else:
+                    ulgm_loss = ulgm_alphas['t'] * loss_function(lp_1, labels_, umask) + \
+                                ulgm_alphas['v'] * loss_function(lp_2, labels_, umask) + \
+                                ulgm_alphas['a'] * loss_function(lp_3, labels_, umask)
+                loss = gamma_1 * loss_function(lp_all, labels_, umask) + \
+                        gamma_2 * beta_e * ulgm_loss + \
+                        gamma_3 * (kl_loss(kl_lp_1, kl_p_all, umask) + kl_loss(kl_lp_2, kl_p_all, umask) + kl_loss(kl_lp_3, kl_p_all, umask))
+
+            if use_aux_losses:
+                gate_term = alpha_gate * masked_mean(gate_entropy.view(-1), umask)
+                loss = loss + gate_term
+            if class_boost_lambda > 0:
+                fused_ce = F.nll_loss(lp_all, labels_.long(), reduction='none')
+                boosted_fused_ce = fused_ce * class_boost_w
+                loss = loss + float(class_boost_lambda) * masked_mean(boosted_fused_ce, umask)
 
         lp_ = all_prob.view(-1, all_prob.size()[2])
 
@@ -509,7 +538,10 @@ if __name__ == '__main__':
     parser.add_argument('--epochs', type=int, default=60, metavar='E', help='number of epochs')
     parser.add_argument('--temp', type=int, default=1, metavar='temp', help='temp')
     parser.add_argument('--tensorboard', action='store_true', default=False, help='Enables tensorboard log')
-    parser.add_argument('--class-weight', action='store_true', default=True, help='use class weights')
+    parser.add_argument('--class-weight', action='store_true', default=False, help='use class weights')
+    parser.add_argument('--train-strategy', type=str, default='original',
+                        choices=['original', 'current'],
+                        help='original: only fused CE + unimodal CE(avg) + self-distill KL(avg); current: paper/full strategy')
     parser.add_argument('--Dataset', default='IEMOCAP', help='dataset to train and test')
     parser.add_argument('--iemocap-pkl-path', type=str, default='data/iemocap_multimodal_features.pkl',
                         help='path of IEMOCAP multimodal feature pkl')
@@ -570,7 +602,7 @@ if __name__ == '__main__':
     parser.add_argument('--pseudo-omega-happy', type=float, default=0.7, help='omega_true for happy rows when mixing triggers')
     parser.add_argument('--iemocap-happy-class', type=int, default=0,
                         help='IEMOCAP label id treated as Happy for pseudo/boosting (dataset-specific)')
-    parser.add_argument('--iemocap-six-class', action='store_true', default=False,
+    parser.add_argument('--iemocap-six-class', action='store_true', default=True,
                         help='disable 4-class focus and keep original IEMOCAP 6-class setup')
     parser.add_argument('--iemocap-no-valid-split', action='store_true', default=False,
                         help='set valid split to 0 and train with all non-test samples')
@@ -594,6 +626,14 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
     validate_ulgm_args(args)
+    if args.train_strategy == 'original':
+        # 取消类别权重、ULGM 侧约束(伪标签)、门控正则与类别关注项
+        args.class_weight = False
+        args.class_weight_mode = 'none'
+        args.no_pseudo_ulgm = True
+        args.no_aux_losses = True
+        args.class_boost_lambda = 0.0
+        args.alpha_gate = 0.0
     if (args.Dataset == 'IEMOCAP') and (not args.class_weight):
         args.class_weight_mode = 'none'
     today = datetime.datetime.now()
@@ -756,6 +796,7 @@ if __name__ == '__main__':
             alpha_gate=args.alpha_gate,
             use_pseudo_ulgm=use_pseudo_ulgm,
             use_aux_losses=use_aux_losses,
+            train_strategy=args.train_strategy,
         )
         valid_indices = getattr(getattr(valid_loader, 'sampler', None), 'indices', None)
         if valid_indices is not None and len(valid_indices) == 0:
@@ -779,6 +820,7 @@ if __name__ == '__main__':
                 alpha_gate=args.alpha_gate,
                 use_pseudo_ulgm=use_pseudo_ulgm,
                 use_aux_losses=use_aux_losses,
+                train_strategy=args.train_strategy,
             )
         test_loss, test_acc, test_label, test_pred, test_mask, test_fscore = train_or_eval_model(
             model, loss_function, kl_loss, test_loader, e,
@@ -798,6 +840,7 @@ if __name__ == '__main__':
             alpha_gate=args.alpha_gate,
             use_pseudo_ulgm=use_pseudo_ulgm,
             use_aux_losses=use_aux_losses,
+            train_strategy=args.train_strategy,
         )
         all_fscore.append(test_fscore)
 
