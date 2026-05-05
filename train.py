@@ -106,6 +106,7 @@ def get_IEMOCAP_loaders(iemocap_pkl_path='data/iemocap_multimodal_features.pkl',
                         use_rppg=False,
                         rppg_npz_path='data/iemocap_rppg_features_ses01_v3.npz',
                         batch_size=32, valid=0.1, test=0.1, split_seed=42, split_max_tries=200,
+                        split_mode='coverage',
                         n_classes=6, num_workers=0, pin_memory=False,
                         target_label_map=None):
     # Build on the same filtered pool so all modalities (including rPPG) share identical split.
@@ -132,12 +133,24 @@ def get_IEMOCAP_loaders(iemocap_pkl_path='data/iemocap_multimodal_features.pkl',
                 test_size = max(0, test_size - overflow)
 
     idx2label_set = {i: set(fullset.videoLabels[fullset.keys[i]]) for i in all_idx}
+    idx2label_list = {i: [int(y) for y in fullset.videoLabels[fullset.keys[i]]] for i in all_idx}
 
     def count_covered_classes(indices):
         c = set()
         for ii in indices:
             c.update(idx2label_set[ii])
         return len(c)
+
+    def count_utterance_classes(indices):
+        counts = np.zeros(n_classes, dtype=np.float64)
+        for ii in indices:
+            for y in idx2label_list[ii]:
+                if 0 <= y < n_classes:
+                    counts[y] += 1.0
+        return counts
+
+    all_counts = count_utterance_classes(all_idx)
+    all_ratio = all_counts / (np.sum(all_counts) + 1e-12)
 
     best = None
     for t in range(split_max_tries):
@@ -152,7 +165,31 @@ def get_IEMOCAP_loaders(iemocap_pkl_path='data/iemocap_multimodal_features.pkl',
         c_train = count_covered_classes(train_idx)
         c_valid = count_covered_classes(valid_idx)
         c_test = count_covered_classes(test_idx)
-        score = (min(c_train, c_valid, c_test), c_train + c_valid + c_test)
+
+        if split_mode == 'balanced':
+            train_counts = count_utterance_classes(train_idx)
+            valid_counts = count_utterance_classes(valid_idx)
+            test_counts = count_utterance_classes(test_idx)
+
+            # Favor splits whose utterance-level class distributions are close
+            # to the global filtered pool, reducing extreme class skew.
+            train_ratio = train_counts / (np.sum(train_counts) + 1e-12)
+            valid_ratio = valid_counts / (np.sum(valid_counts) + 1e-12)
+            test_ratio = test_counts / (np.sum(test_counts) + 1e-12)
+            l1_dist = np.sum(np.abs(train_ratio - all_ratio)) + \
+                      np.sum(np.abs(valid_ratio - all_ratio)) + \
+                      np.sum(np.abs(test_ratio - all_ratio))
+
+            min_valid = np.min(valid_counts) if len(valid_idx) > 0 else np.inf
+            min_test = np.min(test_counts) if len(test_idx) > 0 else np.inf
+            score = (
+                min(c_train, c_valid, c_test),
+                min_valid + min_test,
+                -l1_dist,
+            )
+        else:
+            # Legacy behavior: prioritize class coverage only.
+            score = (min(c_train, c_valid, c_test), c_train + c_valid + c_test)
 
         if best is None or score > best['score']:
             best = {
@@ -196,8 +233,8 @@ def get_IEMOCAP_loaders(iemocap_pkl_path='data/iemocap_multimodal_features.pkl',
                              pin_memory=pin_memory)
     print('IEMOCAP split size -> train: {}, valid: {}, test: {}'.format(
         len(train_idx), len(valid_idx), len(test_idx)))
-    print('IEMOCAP split class coverage -> train: {}, valid: {}, test: {}, seed: {}'.format(
-        best['c_train'], best['c_valid'], best['c_test'], best['seed']))
+    print('IEMOCAP split class coverage -> train: {}, valid: {}, test: {}, seed: {}, mode: {}'.format(
+        best['c_train'], best['c_valid'], best['c_test'], best['seed'], split_mode))
     return train_loader, valid_loader, test_loader
 
 
@@ -559,6 +596,9 @@ if __name__ == '__main__':
                         help='random seed for filtered IEMOCAP split')
     parser.add_argument('--split-max-tries', type=int, default=300,
                         help='max resampling tries to improve class coverage in each split')
+    parser.add_argument('--split-mode', type=str, default='balanced',
+                        choices=['coverage', 'balanced'],
+                        help='coverage: maximize class presence only; balanced: search split with better utterance-level class balance')
     parser.add_argument('--grad-clip', type=float, default=1.0,
                         help='gradient clipping max norm; <=0 disables clipping')
     parser.add_argument('--ulgm-alpha-t', type=float, default=1.0,
@@ -651,9 +691,17 @@ if __name__ == '__main__':
             print('IEMOCAP rPPG npz: {}'.format(args.iemocap_rppg_npz_path))
     report_labels = None
     report_target_names = None
-    if args.Dataset == 'IEMOCAP' and (not args.iemocap_six_class):
-        report_labels = [0, 1, 2, 3]
-        report_target_names = ['happy', 'sad', 'neutral', 'angry']
+    if args.Dataset == 'IEMOCAP':
+        if args.iemocap_six_class:
+            # Common 6-class ids in this preprocessing: 0~5
+            report_labels = [0, 1, 2, 3, 4, 5]
+            report_target_names = ['happy', 'sad', 'neutral', 'angry', 'excited', 'frustrated']
+        else:
+            report_labels = [0, 1, 2, 3]
+            report_target_names = ['happy', 'sad', 'neutral', 'angry']
+    elif args.Dataset == 'MELD':
+        report_labels = [0, 1, 2, 3, 4, 5, 6]
+        report_target_names = ['neutral', 'surprise', 'fear', 'sadness', 'joy', 'disgust', 'anger']
 
     args.cuda = torch.cuda.is_available() and not args.no_cuda
     if args.cuda:
@@ -733,6 +781,7 @@ if __name__ == '__main__':
                                                                       test=args.test_ratio,
                                                                       split_seed=args.split_seed,
                                                                       split_max_tries=args.split_max_tries,
+                                                                      split_mode=args.split_mode,
                                                                       n_classes=n_classes,
                                                                       target_label_map=iemocap_target_label_map,
                                                                       batch_size=batch_size,
